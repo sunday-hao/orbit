@@ -23,9 +23,14 @@ async def train(args):
         "train_opd.py is the on-policy distillation entry point; "
         f"got --advantage-estimator={args.advantage_estimator!r}. Use train.py for other estimators."
     )
-    assert not args.use_critic, "on-policy distillation is actor-only and never uses a PPO critic."
+    assert not args.use_critic, "on-policy distillation is student-only and never uses a PPO critic."
 
     configure_logger()
+    logger.info(
+        "on-policy distillation: student(trained)=%s teacher(frozen, sglang model_name=%s)",
+        args.hf_checkpoint,
+        args.teacher_model_name,
+    )
     startup_timing: dict[str, float] = {}
 
     # allocate the GPUs
@@ -35,25 +40,27 @@ async def train(args):
         init_tracking(args)
 
     # create the rollout manager, with sglang engines inside. This is also where the frozen
-    # teacher model gets served (as a second, update_weights=False model in --sglang-config)
-    # and scored against the student's rollout tokens -- see generate() in orbit/ray/rollout.py
-    # and compute_teacher_log_probs in orbit/rollout/generate_utils/generate_endpoint_utils.py.
-    # The teacher never trains, so unlike PPO's critic it needs no separate Megatron actor group.
+    # teacher model gets served (as a second, update_weights=False model named
+    # args.teacher_model_name in --sglang-config) and scored against the student's rollout
+    # tokens -- see generate() in orbit/ray/rollout.py and compute_teacher_log_probs in
+    # orbit/rollout/generate_utils/generate_endpoint_utils.py. The teacher never trains, so
+    # unlike PPO's critic it needs no separate Megatron training group of its own.
     # need to initialize rollout manager first to calculate num_rollout
     with _timed_block("startup", "create rollout manager", timing_raw=startup_timing):
         rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    # create the (actor-only) training model. OPD never uses a critic.
+    # create the student's training model (called "actor" in orbit's general RL naming --
+    # OPD is student-only, there is no critic).
     async with _timed_phase("startup", "create training models", timing_raw=startup_timing):
-        actor_model, _critic_model = await create_training_models(args, pgs, rollout_manager)
+        student_model, _critic_model = await create_training_models(args, pgs, rollout_manager)
 
     if args.offload_rollout:
         async with _timed_phase("startup", "onload rollout weights", timing_raw=startup_timing):
             await rollout_manager.onload_weights.remote()
 
     # always update weight first so that sglang has the loaded weights from training.
-    async with _timed_phase("startup", "actor update_weights", timing_raw=startup_timing):
-        await actor_model.update_weights()
+    async with _timed_phase("startup", "student update_weights", timing_raw=startup_timing):
+        await student_model.update_weights()
 
     if args.check_weight_update_equal:
         await rollout_manager.check_weights.remote(action="compare")
@@ -73,14 +80,14 @@ async def train(args):
         async with _timed_phase("startup", "eval-only"):
             await rollout_manager.eval.remote(rollout_id=0)
 
-    async def offload_train():
+    async def offload_student():
         if args.offload_train:
-            await actor_model.offload()
+            await student_model.offload()
         else:
-            await actor_model.clear_memory()
+            await student_model.clear_memory()
 
     async def save(rollout_id):
-        await actor_model.save_model(
+        await student_model.save_model(
             rollout_id,
             force_sync=rollout_id == args.num_rollout - 1,
         )
@@ -125,24 +132,25 @@ async def train(args):
 
         if args.offload_train and args.offload_train_async:
             async with _timed_phase(prefix, "prefetch train state", timing_raw=timing_raw):
-                await actor_model.prefetch_train_state(rollout_id)
+                await student_model.prefetch_train_state(rollout_id)
 
-        # actor training reads rollout_data["teacher_log_probs"] via the on_policy_distillation
-        # advantage estimator -- see orbit/backends/training_utils/loss.py.
-        async with _timed_phase(prefix, "actor train", timing_raw=timing_raw):
-            await actor_model.train(rollout_id, rollout_data_ref)
+        # student training reads rollout_data["teacher_log_probs"] alongside its own
+        # student_log_probs via the on_policy_distillation advantage estimator -- see
+        # orbit/backends/training_utils/loss.py.
+        async with _timed_phase(prefix, "student train", timing_raw=timing_raw):
+            await student_model.train(rollout_id, rollout_data_ref)
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             async with _timed_phase(prefix, "save", timing_raw=timing_raw):
                 await save(rollout_id)
 
-        async with _timed_phase(prefix, "offload/clear train", timing_raw=timing_raw):
-            await offload_train()
+        async with _timed_phase(prefix, "offload/clear student", timing_raw=timing_raw):
+            await offload_student()
         if args.offload_rollout:
             async with _timed_phase(prefix, "onload rollout weights", timing_raw=timing_raw):
                 await rollout_manager.onload_weights.remote()
-        async with _timed_phase(prefix, "actor update_weights", timing_raw=timing_raw):
-            await actor_model.update_weights()
+        async with _timed_phase(prefix, "student update_weights", timing_raw=timing_raw):
+            await student_model.update_weights()
         if args.offload_rollout:
             async with _timed_phase(prefix, "onload rollout kv", timing_raw=timing_raw):
                 await rollout_manager.onload_kv.remote()
