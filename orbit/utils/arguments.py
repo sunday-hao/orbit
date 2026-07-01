@@ -1114,6 +1114,15 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
                 default="grpo",
             )
             parser.add_argument(
+                "--teacher-model-name",
+                type=str,
+                default="teacher",
+                help=(
+                    "Name of the frozen teacher model in --sglang-config, used by "
+                    "on_policy_distillation to score rollout responses for teacher_log_probs."
+                ),
+            )
+            parser.add_argument(
                 "--disable-compute-advantages-and-returns",
                 action="store_false",
                 dest="compute_advantages_and_returns",
@@ -2319,6 +2328,20 @@ def orbit_validate_args(args):
         args.critic_load = args.load
     if args.critic_lr is None:
         args.critic_lr = args.lr
+
+    if args.advantage_estimator == "on_policy_distillation":
+        assert args.sglang_config is not None, (
+            "advantage_estimator=on_policy_distillation requires --sglang-config with a "
+            "frozen teacher model entry; there is no other way to serve a second model."
+        )
+        from orbit.backends.sglang_utils.sglang_config import SglangConfig
+
+        teacher_model_names = {m.name for m in SglangConfig.from_yaml(args.sglang_config).models}
+        assert args.teacher_model_name in teacher_model_names, (
+            f"--teacher-model-name={args.teacher_model_name!r} not found in --sglang-config "
+            f"(models defined: {sorted(teacher_model_names)}). Add a `- name: "
+            f"{args.teacher_model_name}` entry with `update_weights: false` for the frozen teacher."
+        )
 
     if args.offload:
         args.offload_train = True

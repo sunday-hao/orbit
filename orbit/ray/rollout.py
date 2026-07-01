@@ -23,9 +23,11 @@ from orbit.rollout.base_types import (
     RolloutFnTrainInput,
     call_rollout_fn,
 )
+from orbit.rollout.generate_utils.generate_endpoint_utils import compute_teacher_log_probs
 from orbit.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from orbit.rollout.rm_hub.math_alignment import compute_math_alignment_metrics, is_math_alignment_sample
 from orbit.utils import dumper_utils, tracking_utils
+from orbit.utils.async_utils import run
 from orbit.utils.environ import enable_experimental_rollout_refactor
 from orbit.utils.health_monitor import RolloutHealthMonitor
 from orbit.utils.http_utils import (
@@ -461,6 +463,8 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        if self.args.advantage_estimator == "on_policy_distillation":
+            run(compute_teacher_log_probs(self.args, self.args.teacher_model_name, data))
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = self._convert_samples_to_train_data(data)
@@ -749,7 +753,7 @@ class RolloutManager:
         if any(sample.weight_versions for sample in samples):
             train_data["weight_versions"] = [sample.weight_versions for sample in samples]
 
-        if "teacher_log_probs" in samples[0].__dict__:
+        if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
         # Pass dynamic global_batch_size to training side

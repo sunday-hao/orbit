@@ -2,12 +2,14 @@
 Utils to integrate SGLang's `/generate` endpoint with RL things like Sample.
 """
 
+import asyncio
 from copy import deepcopy
 from typing import Any
 
 import numpy as np
 import pybase64
 
+from orbit.utils.http_utils import post
 from orbit.utils.processing_utils import encode_image_for_rollout_engine
 from orbit.utils.types import Sample
 
@@ -128,3 +130,41 @@ def get_rollout_topk_from_response(args, output, sample, key):
         return None
     x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
     return x.reshape(len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
+
+
+async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]) -> None:
+    """Score each sample's full (prompt + response) tokens against a frozen, sglang-served
+    teacher model, setting `sample.teacher_log_probs` in place. Used for on-policy
+    distillation: the response tokens were already sampled from the student's policy during
+    rollout, so we just need the teacher's log-probs on those same tokens.
+
+    Sends `max_new_tokens=0` so sglang scores the given tokens instead of generating, and
+    `logprob_start_len` so only the response span's log-probs come back (not the prompt's).
+    Deliberately does not reuse `compute_request_payload`: it treats `max_new_tokens <= 0` as
+    "no room left to generate" and bails out with a TRUNCATED status, which is the wrong
+    semantics here -- a scoring request wants `max_new_tokens=0`.
+    """
+    # Deferred import: sglang_rollout imports from this module at load time, so importing
+    # it back at module level here would be circular.
+    from orbit.rollout.sglang_rollout import GenerateState, get_model_url
+
+    semaphore = GenerateState(args).semaphore
+    url = get_model_url(args, model_name, "/generate")
+
+    async def _score_one(sample: Sample) -> None:
+        if sample.response_length == 0:
+            sample.teacher_log_probs = []
+            return
+        prompt_length = len(sample.tokens) - sample.response_length
+        payload = {
+            "input_ids": sample.tokens,
+            "sampling_params": {"max_new_tokens": 0},
+            "return_logprob": True,
+            "logprob_start_len": prompt_length,
+        }
+        async with semaphore:
+            output = await post(url, payload)
+        input_token_logprobs = output["meta_info"].get("input_token_logprobs") or []
+        sample.teacher_log_probs = [item[0] for item in input_token_logprobs]
+
+    await asyncio.gather(*(_score_one(sample) for sample in samples))
