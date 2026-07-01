@@ -156,15 +156,20 @@ async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]
             sample.teacher_log_probs = []
             return
         prompt_length = len(sample.tokens) - sample.response_length
+        # sglang always returns logprob=None for the first entry of whatever window
+        # logprob_start_len opens (a boundary artifact, not a property of that specific
+        # token). Starting one token earlier absorbs that None into a throwaway boundary
+        # entry (dropped below via [1:]) instead of the first real response token.
+        logprob_start_len = max(prompt_length - 1, 0)
         payload = {
             "input_ids": sample.tokens,
             "sampling_params": {"max_new_tokens": 0},
             "return_logprob": True,
-            "logprob_start_len": prompt_length,
+            "logprob_start_len": logprob_start_len,
         }
         async with semaphore:
             output = await post(url, payload)
         input_token_logprobs = output["meta_info"].get("input_token_logprobs") or []
-        sample.teacher_log_probs = [item[0] for item in input_token_logprobs]
+        sample.teacher_log_probs = [item[0] for item in input_token_logprobs[1:]]
 
     await asyncio.gather(*(_score_one(sample) for sample in samples))
