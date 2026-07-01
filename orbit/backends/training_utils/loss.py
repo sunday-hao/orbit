@@ -426,7 +426,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         teacher_log_probs = rollout_data.get("teacher_log_probs")
         response_lengths = rollout_data.get("response_lengths")
         device = student_log_probs[0].device
-        teacher_log_probs = [t_log_prob.to(device=device) for t_log_prob in teacher_log_probs]
+        teacher_log_probs = [
+            torch.tensor(t_log_prob, dtype=student_log_probs[0].dtype, device=device)
+            for t_log_prob in teacher_log_probs
+        ]
         teacher_log_probs = [
             t_log_prob[-response_length:]
             for t_log_prob, response_length in zip(teacher_log_probs, response_lengths, strict=False)
