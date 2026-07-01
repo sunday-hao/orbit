@@ -1,3 +1,7 @@
+from orbit.utils.flashinfer_patches import apply_flashinfer_cuda_ipc_patch
+
+apply_flashinfer_cuda_ipc_patch()
+
 import dataclasses
 import ipaddress
 import logging
