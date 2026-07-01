@@ -1123,6 +1123,17 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--teacher-num-gpus",
+                type=int,
+                default=None,
+                help=(
+                    "Number of GPUs reserved for the frozen teacher's SGLang engines, used by "
+                    "on_policy_distillation. Must match the teacher model's total GPUs in "
+                    "--sglang-config. Ignored (teacher shares actor/rollout GPUs) when --colocate "
+                    "or --debug-train-only is set, but must still be set to match --sglang-config."
+                ),
+            )
+            parser.add_argument(
                 "--disable-compute-advantages-and-returns",
                 action="store_false",
                 dest="compute_advantages_and_returns",
@@ -2333,6 +2344,12 @@ def orbit_validate_args(args):
         assert args.sglang_config is not None, (
             "advantage_estimator=on_policy_distillation requires --sglang-config with a "
             "frozen teacher model entry; there is no other way to serve a second model."
+        )
+        assert args.teacher_num_gpus is not None, (
+            "advantage_estimator=on_policy_distillation requires --teacher-num-gpus "
+            "(GPUs reserved for the frozen teacher's SGLang engines, used by "
+            "create_opd_placement_groups). This must match the teacher model's total "
+            "GPUs declared in --sglang-config."
         )
         from orbit.backends.sglang_utils.sglang_config import SglangConfig
 

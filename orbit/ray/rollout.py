@@ -23,11 +23,9 @@ from orbit.rollout.base_types import (
     RolloutFnTrainInput,
     call_rollout_fn,
 )
-from orbit.rollout.generate_utils.generate_endpoint_utils import compute_teacher_log_probs
 from orbit.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from orbit.rollout.rm_hub.math_alignment import compute_math_alignment_metrics, is_math_alignment_sample
 from orbit.utils import dumper_utils, tracking_utils
-from orbit.utils.async_utils import run
 from orbit.utils.environ import enable_experimental_rollout_refactor
 from orbit.utils.health_monitor import RolloutHealthMonitor
 from orbit.utils.http_utils import (
@@ -349,10 +347,13 @@ class RolloutServer:
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
 
-    def __init__(self, args, pg):
+    def __init__(self, args, pg, teacher_group=None):
         configure_logger()
 
         self.pg = pg
+        # OPD only: a handle to the TeacherGroup actor (orbit/ray/teacher.py) that scores
+        # this manager's rollout samples. None for every other advantage_estimator.
+        self.teacher_group = teacher_group
         self.args = args
         # Follow-up make args immutable
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
@@ -464,7 +465,10 @@ class RolloutManager:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         if self.args.advantage_estimator == "on_policy_distillation":
-            run(compute_teacher_log_probs(self.args, self.args.teacher_model_name, data))
+            # Scoring runs inside TeacherGroup (a separate actor, see orbit/ray/teacher.py),
+            # not here -- it needs the teacher's own args.sglang_model_routers, populated
+            # when TeacherGroup started its own servers.
+            data = ray.get(self.teacher_group.score.remote(data))
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         data = self._convert_samples_to_train_data(data)
@@ -1022,21 +1026,47 @@ def _compute_megatron_num_gpus(args) -> int:
     return num
 
 
-def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
-    """Start rollout servers: one per model, each with its own router.
+def _compute_teacher_offset(args) -> int:
+    """Absolute PG bundle offset where the OPD teacher's GPUs start.
+
+    Mirrors _compute_rollout_offset: the teacher bucket sits right after the rollout
+    bucket (see create_opd_placement_groups), except in --colocate mode where the teacher
+    shares the same physical GPUs as actor/rollout (offset 0), matching how rollout itself
+    colocates.
+    """
+    if args.debug_train_only or args.colocate:
+        return 0
+    return _compute_rollout_offset(args) + args.rollout_num_gpus
+
+
+def _teacher_model_names(args) -> set[str]:
+    """Names of sglang_config models that are OPD's frozen teacher(s).
+
+    Currently always a single name (args.teacher_model_name), but kept as a set so that
+    multi-teacher support only needs to change this one place.
+    """
+    if getattr(args, "advantage_estimator", None) != "on_policy_distillation":
+        return set()
+    return {args.teacher_model_name}
+
+
+def _start_models_on_pg(
+    args, models: list[ModelConfig], pg, pg_offset: int, megatron_num_gpus: int
+) -> dict[str, RolloutServer]:
+    """Start SGLang engines for `models`, all drawing GPUs from the same placement group `pg`.
+
+    Shared by start_rollout_servers() (the student's non-teacher sglang_config models) and
+    orbit.ray.teacher.start_teacher_servers() (OPD's frozen teacher model(s)) -- the two
+    differ only in *which* models they start and *which* placement group (and absolute PG
+    offset, for the needs_offload calculation) those models' GPUs come from.
 
     Returns a dict mapping model name -> ``RolloutServer``.
     """
-    config = _resolve_sglang_config(args)
-
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
     engine_offset = 0
 
-    rollout_pg_offset = _compute_rollout_offset(args)
-    megatron_num_gpus = _compute_megatron_num_gpus(args)
-
-    for model_idx, model_cfg in enumerate(config.models):
+    for model_idx, model_cfg in enumerate(models):
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
@@ -1055,13 +1085,13 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
             num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
 
-            group_abs_start = rollout_pg_offset + gpu_offset
+            group_abs_start = pg_offset + gpu_offset
             needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
             overrides = dict(group_cfg.overrides)
             if args.offload_rollout and not needs_offload:
                 overrides.setdefault("enable_memory_saver", False)
             logger.info(
-                f"Engine group '{group_cfg.worker_type}' gpu_offset={gpu_offset} "
+                f"Engine group '{group_cfg.worker_type}' (model={model_cfg.name}) gpu_offset={gpu_offset} "
                 f"(abs={group_abs_start}): needs_offload={needs_offload}"
             )
 
@@ -1103,13 +1133,39 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     return servers
 
 
+def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+    """Start rollout servers for the student's (non-teacher) sglang_config models.
+
+    OPD's teacher model(s) are excluded here and started separately by TeacherGroup (see
+    orbit/ray/teacher.py) on their own placement group.
+
+    Returns a dict mapping model name -> ``RolloutServer``.
+    """
+    config = _resolve_sglang_config(args)
+    teacher_names = _teacher_model_names(args)
+    rollout_models = [m for m in config.models if m.name not in teacher_names]
+    return _start_models_on_pg(
+        args, rollout_models, pg, _compute_rollout_offset(args), _compute_megatron_num_gpus(args)
+    )
+
+
 def _resolve_sglang_config(args) -> SglangConfig:
     """Build a SglangConfig from args, choosing the right source."""
     if getattr(args, "sglang_config", None) is not None:
         config = SglangConfig.from_yaml(args.sglang_config)
-        expected = args.rollout_num_gpus
-        actual = config.total_num_gpus
-        assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
+        teacher_names = _teacher_model_names(args)
+
+        rollout_actual = sum(m.total_num_gpus for m in config.models if m.name not in teacher_names)
+        assert rollout_actual == args.rollout_num_gpus, (
+            f"sglang_config non-teacher models total GPUs ({rollout_actual}) != "
+            f"rollout_num_gpus ({args.rollout_num_gpus})"
+        )
+        if teacher_names:
+            teacher_actual = sum(m.total_num_gpus for m in config.models if m.name in teacher_names)
+            assert teacher_actual == args.teacher_num_gpus, (
+                f"sglang_config teacher model(s) total GPUs ({teacher_actual}) != "
+                f"teacher_num_gpus ({args.teacher_num_gpus})"
+            )
         return config
 
     if args.prefill_num_servers is not None:

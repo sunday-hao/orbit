@@ -10,6 +10,7 @@ from orbit.utils.async_utils import eager_create_task
 from ..utils.ray_utils import compute_ray_pin_head_options
 from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
+from .teacher import TeacherGroup
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,49 @@ def create_placement_groups(args):
     }
 
 
+def create_opd_placement_groups(args):
+    """Create placement groups for on-policy distillation's three roles: actor (student
+    training), rollout (student's SGLang serving), and teacher (frozen SGLang serving that
+    scores the student's rollout tokens but never trains and never receives weight updates).
+
+    OPD is student-only (train_opd.py asserts ``not args.use_critic``), so unlike
+    create_placement_groups() there is no critic branch to thread through -- just a
+    straight three-way GPU split.
+
+    In --colocate mode the teacher shares the same physical GPUs as actor/rollout (relying
+    on the existing offload/onload dance) instead of getting a dedicated slice, since
+    colocate is used precisely when GPU budget is tight.
+    """
+    assert not args.use_critic, "on-policy distillation is student-only; use create_placement_groups() for PPO."
+
+    if args.debug_train_only:
+        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+        rollout_slice = slice(0, num_gpus)
+        teacher_slice = slice(0, 0)
+    elif args.debug_rollout_only:
+        num_gpus = args.rollout_num_gpus + args.teacher_num_gpus
+        rollout_slice = slice(0, args.rollout_num_gpus)
+        teacher_slice = slice(args.rollout_num_gpus, num_gpus)
+    elif args.colocate:
+        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+        rollout_slice = slice(0, num_gpus)
+        teacher_slice = slice(0, num_gpus)
+    else:
+        actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+        num_gpus = actor_num_gpus + args.rollout_num_gpus + args.teacher_num_gpus
+        rollout_slice = slice(actor_num_gpus, actor_num_gpus + args.rollout_num_gpus)
+        teacher_slice = slice(actor_num_gpus + args.rollout_num_gpus, num_gpus)
+
+    logger.info(f"Creating OPD placement group with {num_gpus} GPUs...")
+    pg, reordered_bundle_indices, reordered_gpu_ids = _create_placement_group(num_gpus)
+
+    return {
+        "actor": (pg, reordered_bundle_indices, reordered_gpu_ids),
+        "rollout": (pg, reordered_bundle_indices[rollout_slice], reordered_gpu_ids[rollout_slice]),
+        "teacher": (pg, reordered_bundle_indices[teacher_slice], reordered_gpu_ids[teacher_slice]),
+    }
+
+
 def _actor_needs_reference_weights(args) -> bool:
     """Whether the actor should load a separate reference checkpoint.
 
@@ -182,10 +226,10 @@ async def create_training_models(args, pgs, rollout_manager):
     return actor_model, critic_model
 
 
-def create_rollout_manager(args, pg):
+def create_rollout_manager(args, pg, teacher_group=None):
     rollout_manager = RolloutManager.options(
         num_cpus=1, num_gpus=0, **(compute_ray_pin_head_options() if args.pin_rollout_manager_to_head else {})
-    ).remote(args, pg)
+    ).remote(args, pg, teacher_group)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None
@@ -202,3 +246,15 @@ def create_rollout_manager(args, pg):
         ray.get(rollout_manager.offload.remote())
 
     return rollout_manager, num_rollout_per_epoch
+
+
+def create_teacher_group(args, pg):
+    """Create the OPD TeacherGroup actor (see orbit/ray/teacher.py) that serves the frozen
+    teacher model(s) and scores the student's rollout tokens for on_policy_distillation.
+    """
+    teacher_group = TeacherGroup.options(num_cpus=1, num_gpus=0).remote(args, pg)
+
+    if args.offload_rollout:
+        ray.get(teacher_group.offload.remote())
+
+    return teacher_group

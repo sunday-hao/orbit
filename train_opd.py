@@ -6,7 +6,12 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from tqdm.auto import tqdm
 
 from orbit.utils import tracking_utils
-from orbit.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from orbit.ray.placement_group import (
+    create_opd_placement_groups,
+    create_rollout_manager,
+    create_teacher_group,
+    create_training_models,
+)
 from orbit.utils.arguments import parse_args
 from orbit.utils.logging_utils import configure_logger
 from orbit.utils.metric_utils import compute_rollout_step
@@ -33,21 +38,30 @@ async def train(args):
     )
     startup_timing: dict[str, float] = {}
 
-    # allocate the GPUs
+    # allocate the GPUs: three roles -- actor (student training), rollout (student's SGLang
+    # serving), and teacher (frozen SGLang serving). The teacher never trains, so unlike
+    # PPO's critic it needs no separate Megatron training group of its own.
     with _timed_block("startup", "placement groups", timing_raw=startup_timing):
-        pgs = create_placement_groups(args)
+        pgs = create_opd_placement_groups(args)
     with _timed_block("startup", "init tracking", timing_raw=startup_timing):
         init_tracking(args)
 
-    # create the rollout manager, with sglang engines inside. This is also where the frozen
-    # teacher model gets served (as a second, update_weights=False model named
-    # args.teacher_model_name in --sglang-config) and scored against the student's rollout
-    # tokens -- see generate() in orbit/ray/rollout.py and compute_teacher_log_probs in
-    # orbit/rollout/generate_utils/generate_endpoint_utils.py. The teacher never trains, so
-    # unlike PPO's critic it needs no separate Megatron training group of its own.
+    # create the TeacherGroup actor first: it serves the frozen teacher model(s) on the
+    # "teacher" placement group (see orbit/ray/teacher.py) and scores the student's rollout
+    # tokens for on_policy_distillation (compute_teacher_log_probs). It mirrors
+    # RolloutManager's Manager -> RolloutServer -> ServerGroup hierarchy but as its own
+    # actor, so extending to multiple teachers later only means more entries in
+    # TeacherGroup.servers -- no change to RolloutManager or the student rollout path.
+    with _timed_block("startup", "create teacher group", timing_raw=startup_timing):
+        teacher_group = create_teacher_group(args, pgs["teacher"])
+
+    # create the rollout manager, with sglang engines inside. RolloutManager holds a handle
+    # to teacher_group and calls it during generate() to score the student's rollout tokens.
     # need to initialize rollout manager first to calculate num_rollout
     with _timed_block("startup", "create rollout manager", timing_raw=startup_timing):
-        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+        rollout_manager, num_rollout_per_epoch = create_rollout_manager(
+            args, pgs["rollout"], teacher_group=teacher_group
+        )
 
     # create the student's training model (called "actor" in orbit's general RL naming --
     # OPD is student-only, there is no critic).
@@ -56,7 +70,7 @@ async def train(args):
 
     if args.offload_rollout:
         async with _timed_phase("startup", "onload rollout weights", timing_raw=startup_timing):
-            await rollout_manager.onload_weights.remote()
+            await asyncio.gather(rollout_manager.onload_weights.remote(), teacher_group.onload_weights.remote())
 
     # always update weight first so that sglang has the loaded weights from training.
     async with _timed_phase("startup", "student update_weights", timing_raw=startup_timing):
@@ -67,7 +81,7 @@ async def train(args):
 
     if args.offload_rollout:
         async with _timed_phase("startup", "onload rollout kv", timing_raw=startup_timing):
-            await rollout_manager.onload_kv.remote()
+            await asyncio.gather(rollout_manager.onload_kv.remote(), teacher_group.onload_kv.remote())
 
     if startup_timing:
         startup_metrics = {f"timing_s_startup/{k}": v for k, v in startup_timing.items()}
@@ -128,7 +142,9 @@ async def train(args):
             async with _timed_phase(
                 prefix, "offload rollout", timing_raw=timing_raw, start_extra=f"tags={offload_tags}"
             ):
-                await rollout_manager.offload.remote(tags=offload_tags)
+                await asyncio.gather(
+                    rollout_manager.offload.remote(tags=offload_tags), teacher_group.offload.remote(tags=offload_tags)
+                )
 
         if args.offload_train and args.offload_train_async:
             async with _timed_phase(prefix, "prefetch train state", timing_raw=timing_raw):
@@ -148,12 +164,12 @@ async def train(args):
             await offload_student()
         if args.offload_rollout:
             async with _timed_phase(prefix, "onload rollout weights", timing_raw=timing_raw):
-                await rollout_manager.onload_weights.remote()
+                await asyncio.gather(rollout_manager.onload_weights.remote(), teacher_group.onload_weights.remote())
         async with _timed_phase(prefix, "student update_weights", timing_raw=timing_raw):
             await student_model.update_weights()
         if args.offload_rollout:
             async with _timed_phase(prefix, "onload rollout kv", timing_raw=timing_raw):
-                await rollout_manager.onload_kv.remote()
+                await asyncio.gather(rollout_manager.onload_kv.remote(), teacher_group.onload_kv.remote())
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             async with _timed_phase(prefix, "eval", timing_raw=timing_raw):
@@ -176,7 +192,7 @@ async def train(args):
 
     rollout_pbar.close()
     async with _timed_phase("shutdown", "dispose rollout"):
-        await rollout_manager.dispose.remote()
+        await asyncio.gather(rollout_manager.dispose.remote(), teacher_group.dispose.remote())
 
 
 if __name__ == "__main__":
