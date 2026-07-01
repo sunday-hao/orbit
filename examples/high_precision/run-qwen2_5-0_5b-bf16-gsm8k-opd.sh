@@ -32,7 +32,7 @@ SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen2.5-0.5B-Instruct_gsm8k_opd"
 # time-share this one GPU via the offload/onload dance (see orbit/ray/teacher.py and the
 # create_opd_placement_groups() colocate branch in orbit/ray/placement_group.py).
 GPUS_PER_NODE=1
-RAY_NUM_CPUS=128
+RAY_NUM_CPUS=64
 
 # === Model args ===
 source "${ORBIT_ROOT}/orbit_plugins/model_args/qwen2.5-0.5B.sh"   # provides MODEL_ARGS=(...)
@@ -163,6 +163,9 @@ SGLANG_ARGS=(
     --sglang-config "${OPD_SGLANG_CONFIG}"
     --sglang-max-running-requests 1024
     --router-disable-circuit-breaker
+    # flashinfer, not fa3 -- SGLang has no separate "fa2" backend name, flashinfer is its
+    # own FA2-equivalent kernel.
+    --sglang-attention-backend flashinfer
 )
 
 MISC_ARGS=(
