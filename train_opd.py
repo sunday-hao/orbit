@@ -8,7 +8,6 @@ from tqdm.auto import tqdm
 from orbit.utils import tracking_utils
 from orbit.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from orbit.utils.arguments import parse_args
-from orbit.utils.async_utils import eager_create_task
 from orbit.utils.logging_utils import configure_logger
 from orbit.utils.metric_utils import compute_rollout_step
 from orbit.utils.misc import should_run_periodic_action
@@ -24,6 +23,7 @@ async def train(args):
         "train_opd.py is the on-policy distillation entry point; "
         f"got --advantage-estimator={args.advantage_estimator!r}. Use train.py for other estimators."
     )
+    assert not args.use_critic, "on-policy distillation is actor-only and never uses a PPO critic."
 
     configure_logger()
     startup_timing: dict[str, float] = {}
@@ -35,16 +35,17 @@ async def train(args):
         init_tracking(args)
 
     # create the rollout manager, with sglang engines inside. This is also where the frozen
-    # teacher model gets served (as a second, update_weights=False model in --sglang-config) --
-    # unlike PPO's critic, the teacher never trains, so it needs no separate Megatron actor
-    # group; see orbit/rollout/generate_utils/generate_endpoint_utils.py:compute_teacher_log_probs.
+    # teacher model gets served (as a second, update_weights=False model in --sglang-config)
+    # and scored against the student's rollout tokens -- see generate() in orbit/ray/rollout.py
+    # and compute_teacher_log_probs in orbit/rollout/generate_utils/generate_endpoint_utils.py.
+    # The teacher never trains, so unlike PPO's critic it needs no separate Megatron actor group.
     # need to initialize rollout manager first to calculate num_rollout
     with _timed_block("startup", "create rollout manager", timing_raw=startup_timing):
         rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    # create the actor and critic models
+    # create the (actor-only) training model. OPD never uses a critic.
     async with _timed_phase("startup", "create training models", timing_raw=startup_timing):
-        actor_model, critic_model = await create_training_models(args, pgs, rollout_manager)
+        actor_model, _critic_model = await create_training_models(args, pgs, rollout_manager)
 
     if args.offload_rollout:
         async with _timed_phase("startup", "onload rollout weights", timing_raw=startup_timing):
@@ -74,26 +75,15 @@ async def train(args):
 
     async def offload_train():
         if args.offload_train:
-            if args.use_critic:
-                await critic_model.offload()
-                if rollout_id >= args.num_critic_only_steps:
-                    await actor_model.offload()
-            else:
-                await actor_model.offload()
+            await actor_model.offload()
         else:
             await actor_model.clear_memory()
 
     async def save(rollout_id):
-        if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
-            await actor_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
-        if args.use_critic:
-            await critic_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
+        await actor_model.save_model(
+            rollout_id,
+            force_sync=rollout_id == args.num_rollout - 1,
+        )
         if args.rollout_global_dataset:
             await rollout_manager.save.remote(rollout_id)
 
@@ -118,6 +108,7 @@ async def train(args):
             async with _timed_phase(prefix, "eval-before-train", timing_raw=timing_raw):
                 await rollout_manager.eval.remote(rollout_id)
 
+        # student rollout generation + teacher scoring both happen inside this single call.
         async with _timed_phase(prefix, "generate", timing_raw=timing_raw):
             rollout_data_ref = await rollout_manager.generate.remote(rollout_id)
 
@@ -136,15 +127,10 @@ async def train(args):
             async with _timed_phase(prefix, "prefetch train state", timing_raw=timing_raw):
                 await actor_model.prefetch_train_state(rollout_id)
 
-        if args.use_critic:
-            critic_task = await eager_create_task(critic_model.train(rollout_id, rollout_data_ref))
-            if rollout_id >= args.num_critic_only_steps:
-                async with _timed_phase(prefix, "actor train", timing_raw=timing_raw):
-                    await actor_model.train(rollout_id, rollout_data_ref)
-            await critic_task
-        else:
-            async with _timed_phase(prefix, "actor train", timing_raw=timing_raw):
-                await actor_model.train(rollout_id, rollout_data_ref)
+        # actor training reads rollout_data["teacher_log_probs"] via the on_policy_distillation
+        # advantage estimator -- see orbit/backends/training_utils/loss.py.
+        async with _timed_phase(prefix, "actor train", timing_raw=timing_raw):
+            await actor_model.train(rollout_id, rollout_data_ref)
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             async with _timed_phase(prefix, "save", timing_raw=timing_raw):
