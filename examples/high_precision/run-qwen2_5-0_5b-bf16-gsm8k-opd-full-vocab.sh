@@ -83,6 +83,23 @@ sglang:
           # distribution on the training side -- this is the server-startup flag that
           # allows that.
           enable_return_hidden_states: true
+          # A radix-cache hit skips the forward pass for the matched prefix, so no hidden
+          # state gets captured for those positions -- confirmed on a real run (a
+          # per-request cache-salt didn't reliably avoid this). Disabling the cache
+          # entirely guarantees every position gets a fresh hidden state; the teacher is
+          # only ever used for scoring here, so losing prefix-cache speedups doesn't cost
+          # much.
+          disable_radix_cache: true
+          # Root cause of hidden_states truncation, confirmed against sglang's own source
+          # (scheduler_output_processor_mixin.py): hidden-state capture lives inside
+          # `if req.is_chunked <= 0:`, so only the LAST chunk of a chunked-prefill request
+          # ever gets its hidden states appended -- every earlier chunk is silently
+          # dropped. -1 disables chunked prefill entirely (not "a very large chunk size" --
+          # sglang maps -1 to rem_chunk_tokens=None internally, its "chunking disabled"
+          # state), so a scoring request's prefill is never split into chunks regardless of
+          # length, rather than relying on a fixed size staying ahead of
+          # --rollout-max-response-len.
+          chunked_prefill_size: -1
 EOF
 
 # === ARGS arrays ===
@@ -208,6 +225,12 @@ DEBUG_ARGS=(
     --log-passrate
 )
 
-PEFT_ARGS=()
-
+PEFT_ARGS=(
+    --peft-method oft
+    --peft-variant standard
+    --oft-type canonical_oft
+    --oft-block-size 128
+    --oft-eps 6e-5
+    --target-modules all-linear
+)
 source "${ORBIT_ROOT}/scripts/lib/launcher.sh"

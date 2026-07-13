@@ -180,14 +180,35 @@ async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]
             }
             async with semaphore:
                 output = await post(url, payload)
-            hidden_states = output["meta_info"].get("hidden_states") or []
+            # meta_info["hidden_states"] is wrapped in an extra request-batch dimension
+            # (always length 1 here, since each HTTP call scores exactly one sample) --
+            # hidden_states[0] is the actual per-position sequence, one vector per token
+            # of the full prompt+response input_ids we sent (confirmed empirically: its
+            # length matched len(sample.tokens), not response_length).
+            outer_hidden_states = output["meta_info"].get("hidden_states") or []
+            if len(outer_hidden_states) != 1:
+                raise AssertionError(
+                    f"expected meta_info['hidden_states'] to have exactly 1 (batch) entry, got "
+                    f"{len(outer_hidden_states)} -- sglang's return_hidden_states response shape "
+                    "didn't match what compute_teacher_log_probs assumed. See "
+                    "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
+                )
+            hidden_states = outer_hidden_states[0]
             teacher_hidden_states = hidden_states[-sample.response_length :]
-            assert len(teacher_hidden_states) == sample.response_length, (
-                f"teacher hidden_states length ({len(teacher_hidden_states)}) != "
-                f"response_length ({sample.response_length}) -- sglang's return_hidden_states "
-                "response shape didn't match what compute_teacher_log_probs assumed; see "
-                "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
-            )
+            if len(teacher_hidden_states) != sample.response_length:
+                meta_info = output["meta_info"]
+                raise AssertionError(
+                    f"teacher hidden_states length ({len(teacher_hidden_states)}) != "
+                    f"response_length ({sample.response_length}) -- len(hidden_states)="
+                    f"{len(hidden_states)}, len(sample.tokens)={len(sample.tokens)}, "
+                    f"cached_tokens={meta_info.get('cached_tokens')}, "
+                    f"cached_tokens_details={meta_info.get('cached_tokens_details')}, "
+                    f"prompt_tokens={meta_info.get('prompt_tokens')}, "
+                    f"completion_tokens={meta_info.get('completion_tokens')}. sglang's "
+                    "return_hidden_states response shape didn't match what "
+                    "compute_teacher_log_probs assumed. See "
+                    "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
+                )
             sample.teacher_hidden_states = teacher_hidden_states
             return
         prompt_length = len(sample.tokens) - sample.response_length
