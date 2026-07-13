@@ -1077,11 +1077,13 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft_loss", "opd_full_vocab_loss", "custom_loss"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
-                    "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
+                    "Choose loss type, currently support ppo policy_loss, sft_loss, or "
+                    "opd_full_vocab_loss (exact full-vocabulary KL against a frozen teacher, "
+                    "see --teacher-score-mode). If custom_loss is set, we will use the function "
+                    "path from `--custom-loss-function-path`."
                 ),
             )
             parser.add_argument(
@@ -1131,6 +1133,35 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
                     "on_policy_distillation. Must match the teacher model's total GPUs in "
                     "--sglang-config. Ignored (teacher shares actor/rollout GPUs) when --colocate "
                     "or --debug-train-only is set, but must still be set to match --sglang-config."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-score-mode",
+                type=str,
+                choices=["sampled_token", "full_vocab"],
+                default="sampled_token",
+                help=(
+                    "How compute_teacher_log_probs scores the teacher: 'sampled_token' (default) "
+                    "scores only the response tokens the student already sampled, for the "
+                    "REINFORCE-style on_policy_distillation advantage. 'full_vocab' requests the "
+                    "teacher's last-layer hidden state at every response position "
+                    "(return_hidden_states=True) for use with --loss-type opd_full_vocab_loss's "
+                    "exact KL divergence -- the training side reconstructs the teacher's full "
+                    "vocab distribution via --teacher-hf-checkpoint's LM head, instead of "
+                    "transmitting the full logprob vector over HTTP."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-hf-checkpoint",
+                type=str,
+                default=None,
+                help=(
+                    "Path to the frozen teacher's HF checkpoint, used only by "
+                    "--teacher-score-mode full_vocab to load the teacher's LM head "
+                    "(lm_head.weight or, if tied, model.embed_tokens.weight) so the training "
+                    "side can reconstruct full vocab logits from the teacher's hidden states. "
+                    "Should be the same checkpoint referenced by the teacher's --sglang-config "
+                    "model_path."
                 ),
             )
             parser.add_argument(
@@ -2358,6 +2389,33 @@ def orbit_validate_args(args):
             f"--teacher-model-name={args.teacher_model_name!r} not found in --sglang-config "
             f"(models defined: {sorted(teacher_model_names)}). Add a `- name: "
             f"{args.teacher_model_name}` entry with `update_weights: false` for the frozen teacher."
+        )
+
+    if args.loss_type == "opd_full_vocab_loss":
+        assert args.teacher_score_mode == "full_vocab", (
+            "--loss-type opd_full_vocab_loss requires --teacher-score-mode full_vocab "
+            "(the teacher must return its full-vocabulary distribution, not just the "
+            "sampled token's log-prob)."
+        )
+        assert args.advantage_estimator == "on_policy_distillation", (
+            "--loss-type opd_full_vocab_loss reuses on_policy_distillation's teacher-serving "
+            "infra (TeacherGroup/placement groups) as its 'a teacher is configured' signal -- "
+            "set --advantage-estimator on_policy_distillation even though its scalar advantage "
+            "is unused here."
+        )
+        assert not args.compute_advantages_and_returns, (
+            "opd_full_vocab_loss computes its objective directly from logits; pass "
+            "--disable-compute-advantages-and-returns to skip the unused PPO-style pipeline."
+        )
+        assert args.tensor_model_parallel_size == 1 and args.context_parallel_size == 1, (
+            "opd_full_vocab_loss doesn't yet support tensor_model_parallel_size > 1 or "
+            "context_parallel_size > 1."
+        )
+        assert args.teacher_hf_checkpoint is not None, (
+            "--teacher-score-mode full_vocab reconstructs the teacher's full vocab "
+            "distribution from its hidden states via its own LM head -- set "
+            "--teacher-hf-checkpoint to the same checkpoint the teacher's --sglang-config "
+            "model_path points at."
         )
 
     if args.offload:

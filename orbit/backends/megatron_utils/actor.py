@@ -48,6 +48,7 @@ from .peft_offload import (
 from .peft_utils import create_peft_instance, get_peft_method, is_peft_enabled
 from .replay_utils import get_register_replay_list_func
 from .state_mode import should_backup_actor_after_train, uses_adapter_state
+from ..training_utils.teacher_lm_head import load_teacher_lm_head, offload_teacher_lm_head, onload_teacher_lm_head
 from .update_weight.common import named_adapter_params, named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
 try:
@@ -205,6 +206,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
+        if self.args.loss_type == "opd_full_vocab_loss":
+            # Eagerly load now (onto CPU) so the first train step doesn't stall on a
+            # safetensors read; wake_up() moves it to GPU before use.
+            load_teacher_lm_head(self.args.teacher_hf_checkpoint)
+
         if self.args.colocate or get_peft_method(self.args) != "none":
             # PEFT (LoRA/OFT) routes through UpdateWeightFromTensor regardless
             # of colocate, so the unified PeftWeightTransport (IPC for colocate,
@@ -259,6 +265,9 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("after offload optimizer")
         offload_megatron_frozen_base_to_cpu(self.model)
         print_memory("after offload frozen_base")
+        if self.args.loss_type == "opd_full_vocab_loss":
+            offload_teacher_lm_head(self.args.teacher_hf_checkpoint)
+            print_memory("after offload teacher_lm_head")
 
         print_memory("after offload model")
 
@@ -301,6 +310,12 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.offload_train_adapter:
                 load_megatron_adapter_to_gpu(self.model)
                 print_memory("after wake_up adapter")
+
+        if self.args.loss_type == "opd_full_vocab_loss":
+            onload_teacher_lm_head(
+                self.args.teacher_hf_checkpoint, torch.device("cuda", torch.cuda.current_device())
+            )
+            print_memory("after wake_up teacher_lm_head")
 
         if self.args.offload_train_optimizer:
             load_megatron_optimizer(self.optimizer)

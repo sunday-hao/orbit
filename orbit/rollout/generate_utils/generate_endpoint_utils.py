@@ -134,12 +134,17 @@ def get_rollout_topk_from_response(args, output, sample, key):
 
 async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]) -> None:
     """Score each sample's full (prompt + response) tokens against a frozen, sglang-served
-    teacher model, setting `sample.teacher_log_probs` in place. Used for on-policy
-    distillation: the response tokens were already sampled from the student's policy during
-    rollout, so we just need the teacher's log-probs on those same tokens.
+    teacher model, setting `sample.teacher_log_probs` (or, in full_vocab mode,
+    `sample.teacher_hidden_states`) in place. Used for on-policy distillation: the response
+    tokens were already sampled from the student's policy during rollout, so we just need
+    the teacher's log-probs on those same tokens (--teacher-score-mode sampled_token) or its
+    last-layer hidden state at those positions (--teacher-score-mode full_vocab, for
+    --loss-type opd_full_vocab_loss's exact KL -- the training side reconstructs the
+    teacher's full vocab distribution from the hidden state via the teacher's own LM head,
+    see orbit/backends/training_utils/teacher_lm_head.py, instead of transmitting the much
+    larger full logprob vector over HTTP).
 
-    Sends `max_new_tokens=0` so sglang scores the given tokens instead of generating, and
-    `logprob_start_len` so only the response span's log-probs come back (not the prompt's).
+    Sends `max_new_tokens=0` so sglang scores the given tokens instead of generating.
     Deliberately does not reuse `compute_request_payload`: it treats `max_new_tokens <= 0` as
     "no room left to generate" and bails out with a TRUNCATED status, which is the wrong
     semantics here -- a scoring request wants `max_new_tokens=0`.
@@ -148,12 +153,42 @@ async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]
     # it back at module level here would be circular.
     from orbit.rollout.sglang_rollout import GenerateState, get_model_url
 
-    semaphore = GenerateState(args).semaphore
+    state = GenerateState(args)
+    semaphore = state.semaphore
     url = get_model_url(args, model_name, "/generate")
+    full_vocab = getattr(args, "teacher_score_mode", "sampled_token") == "full_vocab"
 
     async def _score_one(sample: Sample) -> None:
         if sample.response_length == 0:
-            sample.teacher_log_probs = []
+            if full_vocab:
+                sample.teacher_hidden_states = []
+            else:
+                sample.teacher_log_probs = []
+            return
+        if full_vocab:
+            # A max_new_tokens=0 request completes entirely during prefill, so sglang
+            # captures a hidden state for every position of the full input_ids we send
+            # (prompt+response) -- unlike input_token_logprobs, this isn't scoped by
+            # logprob_start_len and has no window-boundary artifact to drop. Slice the
+            # last response_length entries ourselves, matching the tokens[-response_length:]
+            # convention used elsewhere (e.g. orbit/backends/training_utils/loss.py's
+            # get_responses).
+            payload = {
+                "input_ids": sample.tokens,
+                "sampling_params": {"max_new_tokens": 0},
+                "return_hidden_states": True,
+            }
+            async with semaphore:
+                output = await post(url, payload)
+            hidden_states = output["meta_info"].get("hidden_states") or []
+            teacher_hidden_states = hidden_states[-sample.response_length :]
+            assert len(teacher_hidden_states) == sample.response_length, (
+                f"teacher hidden_states length ({len(teacher_hidden_states)}) != "
+                f"response_length ({sample.response_length}) -- sglang's return_hidden_states "
+                "response shape didn't match what compute_teacher_log_probs assumed; see "
+                "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
+            )
+            sample.teacher_hidden_states = teacher_hidden_states
             return
         prompt_length = len(sample.tokens) - sample.response_length
         # sglang always returns logprob=None for the first entry of whatever window

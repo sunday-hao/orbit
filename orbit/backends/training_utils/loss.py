@@ -27,6 +27,7 @@ from .cp_utils import (
     get_sum_of_sample_mean,
 )
 from .parallel import get_parallel_state
+from .teacher_lm_head import load_teacher_lm_head
 
 def _response_masked_max(
     x: torch.Tensor,
@@ -899,6 +900,95 @@ def sft_loss_function(
     )
 
 
+def opd_full_vocab_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute exact full-vocabulary KL divergence against a frozen teacher.
+
+    Unlike on_policy_distillation (which treats `teacher_log_prob - student_log_prob` on the
+    sampled token as a REINFORCE-style advantage fed through the PPO surrogate), this uses the
+    teacher's full-vocabulary distribution (`--teacher-score-mode full_vocab`) to compute the
+    real KL(student || teacher) directly from `logits`, with no advantage/returns pipeline.
+
+    The teacher's distribution is reconstructed here, not transmitted: rollout only ships the
+    teacher's last-layer hidden state per response position (`batch["teacher_hidden_states"]`),
+    and this multiplies it through the teacher's own LM head (loaded via
+    `orbit/backends/training_utils/teacher_lm_head.py`, kept resident on this GPU by the
+    actor's sleep()/wake_up() hooks) to get the teacher's full logits -- far cheaper than
+    shipping a vocab-sized vector per token over HTTP.
+
+    Args:
+        args: Configuration (passed through to helpers).
+        batch: Mini-batch with "unconcat_tokens", "response_lengths", "total_lengths", and
+            "teacher_hidden_states".
+        logits: Policy logits with shape `[1, T, V]`.
+        sum_of_sample_mean: Reduction function that averages per-sample values.
+
+    Returns:
+        Tuple of `(loss, metrics)` where `metrics` contains a single detached scalar "loss".
+    """
+    parallel_state = get_parallel_state()
+    assert parallel_state.tp.size == 1 and parallel_state.cp.size == 1, (
+        "opd_full_vocab_loss requires tensor_model_parallel_size == 1 and "
+        "context_parallel_size == 1 (enforced at arg-parse time; see orbit/utils/arguments.py)."
+    )
+    response_lengths = batch["response_lengths"]
+    total_lengths = batch["total_lengths"]
+
+    teacher_lm_head = load_teacher_lm_head(args.teacher_hf_checkpoint).to(logits.device, torch.float32)
+    teacher_vocab_size = teacher_lm_head.size(0)
+
+    kl_per_sample = []
+    for i, (logits_chunk, _tokens_chunk) in enumerate(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=batch.get("max_seq_lens", None),
+        )
+    ):
+        vocab_size = logits_chunk.size(-1)
+        # Default fill is a large finite negative, not -inf: Megatron pads vocab_size for TP
+        # divisibility beyond the teacher's real (unpadded) vocab, so those trailing columns
+        # are never written below. -inf there would turn into NaN (0 * -inf) if the student
+        # ever puts stray mass on a padding row.
+        teacher_log_probs_full = logits_chunk.new_full((logits_chunk.size(0), vocab_size), -1e4)
+        if logits_chunk.size(0) > 0:
+            teacher_hidden_states = torch.tensor(
+                batch["teacher_hidden_states"][i], dtype=torch.float32, device=logits_chunk.device
+            )
+            assert teacher_hidden_states.size(-1) == teacher_lm_head.size(-1), (
+                f"teacher hidden_state width ({teacher_hidden_states.size(-1)}) != teacher LM "
+                f"head input dim ({teacher_lm_head.size(-1)}) -- mismatched --teacher-hf-checkpoint?"
+            )
+            teacher_logits = teacher_hidden_states @ teacher_lm_head.T
+            teacher_log_probs_full[:, :teacher_vocab_size] = torch.log_softmax(teacher_logits, dim=-1)
+
+        student_log_probs_full = torch.log_softmax(logits_chunk.float(), dim=-1)
+        student_probs_full = student_log_probs_full.exp()
+        kl = (student_probs_full * (student_log_probs_full - teacher_log_probs_full)).sum(dim=-1)
+        kl_per_sample.append(kl)
+
+    kl_per_sample = torch.cat(kl_per_sample, dim=0)
+    loss = sum_of_sample_mean(kl_per_sample)
+
+    # make sure the gradient could backprop correctly.
+    if kl_per_sample.numel() == 0:
+        loss = loss + 0 * logits.sum()
+
+    return (
+        loss,
+        {
+            "loss": loss.clone().detach(),
+        },
+    )
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -908,8 +998,8 @@ def loss_function(
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
-    Selects one of "policy_loss", "value_loss", "sft_loss", or a custom loss
-    function based on `args.loss_type`, computes the loss and metrics, then
+    Selects one of "policy_loss", "value_loss", "sft_loss", "opd_full_vocab_loss", or a
+    custom loss function based on `args.loss_type`, computes the loss and metrics, then
     rescales the loss by micro-batch and parallelism factors to integrate with
     Megatron's gradient accumulation.
 
@@ -949,6 +1039,8 @@ def loss_function(
             func = value_loss_function
         case "sft_loss":
             func = sft_loss_function
+        case "opd_full_vocab_loss":
+            func = opd_full_vocab_loss_function
         case "custom_loss":
             func = load_function(args.custom_loss_function_path)
         case _:

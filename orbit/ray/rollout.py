@@ -760,6 +760,9 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if samples[0].teacher_hidden_states is not None:
+            train_data["teacher_hidden_states"] = [sample.teacher_hidden_states for sample in samples]
+
         # Pass dynamic global_batch_size to training side
         assert self.args.use_dynamic_global_batch_size == hasattr(self, "_dynamic_global_batch_size")
         if hasattr(self, "_dynamic_global_batch_size"):
@@ -804,6 +807,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_hidden_states",
                 "weight_versions",
             ]:
                 if key not in data:

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Qwen2.5-0.5B-Instruct BF16 On-Policy Distillation (OPD) + LoRA on GSM8K, scored against a
-# frozen Qwen2.5-1.5B-Instruct teacher. Self-contained launcher.
+# Qwen2.5-0.5B-Instruct BF16 full-vocabulary On-Policy Distillation (OPD) on GSM8K, scored
+# against a frozen Qwen2.5-1.5B-Instruct teacher. Unlike the sampled-token OPD launcher
+# (run-qwen2_5-0_5b-bf16-gsm8k-opd-lora.sh), the teacher returns its full-vocabulary
+# distribution at every response position (--teacher-score-mode full_vocab) and the student
+# is trained with an exact KL divergence (--loss-type opd_full_vocab_loss) instead of the
+# REINFORCE-style teacher_log_prob - student_log_prob advantage. Self-contained launcher.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +13,7 @@ source "${ORBIT_ROOT}/scripts/lib/tool_env.sh"
 source "${ORBIT_ROOT}/scripts/lib/common.sh"
 
 # === Recipe identity ===
-LAUNCHER_NAME=run_qwen25_05b_bf16_gsm8k_megatron_opd_lora
+LAUNCHER_NAME=run_qwen25_05b_bf16_gsm8k_megatron_opd_full_vocab
 WANDB_PROJECT=${WANDB_PROJECT:-orbit-release}
 WANDB_GROUP=${WANDB_GROUP:-${LAUNCHER_NAME}}
 PRECISION_PROFILE=bf16
@@ -19,7 +23,7 @@ RUN_LOG="${ORBIT_ROOT}/logs/${LAUNCHER_NAME}_$(date +%Y%m%d_%H%M%S).log"
 # === Paths ===
 : "${HF_CKPT:?set HF_CKPT to the student Hugging Face checkpoint path}"
 : "${MEGATRON_LOAD:?set MEGATRON_LOAD to the student Megatron torch_dist checkpoint path}"
-SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen2.5-0.5B-Instruct_gsm8k_opd"
+SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen2.5-0.5B-Instruct_gsm8k_opd_full_vocab"
 : "${TRAIN_JSONL:?set TRAIN_JSONL to a GSM8K training data path (.jsonl or .parquet)}"
 : "${TEST_JSONL:?set TEST_JSONL to a GSM8K eval data path (.jsonl or .parquet), or set DISABLE_EVAL=1}"
 
@@ -38,9 +42,9 @@ RAY_NUM_CPUS=64
 source "${ORBIT_ROOT}/orbit_plugins/model_args/qwen2.5-0.5B.sh"   # provides MODEL_ARGS=(...)
 
 # === Training schedule ===
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-15}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-2}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
 
 # `wc -l` undercounts .parquet files (binary) -- count rows with pyarrow instead.
@@ -74,6 +78,11 @@ sglang:
         num_gpus: 1
         overrides:
           mem_fraction_static: 0.25
+          # --teacher-score-mode full_vocab needs the teacher's last-layer hidden states
+          # (return_hidden_states=True per-request) to reconstruct its full vocab
+          # distribution on the training side -- this is the server-startup flag that
+          # allows that.
+          enable_return_hidden_states: true
 EOF
 
 # === ARGS arrays ===
@@ -113,14 +122,24 @@ OPTIMIZER_ARGS=(
     --adam-beta2 0.999
 )
 
-# on_policy_distillation's loss (advantage = teacher_log_prob - student_log_prob) is built
-# into orbit/backends/training_utils/loss.py -- no custom loss function needed.
+# --teacher-score-mode full_vocab makes compute_teacher_log_probs request the teacher's
+# last-layer hidden state at every response position (return_hidden_states=True), instead
+# of just the sampled token's log-prob. --teacher-hf-checkpoint lets the training side
+# reconstruct the teacher's full vocab distribution from that hidden state via the
+# teacher's own LM head (orbit/backends/training_utils/teacher_lm_head.py) -- far cheaper
+# than shipping a vocab-sized logprob vector per token over HTTP. --loss-type
+# opd_full_vocab_loss then computes the exact KL(student || teacher) directly from logits
+# -- no advantage/returns pipeline, hence --disable-compute-advantages-and-returns.
 RL_ARGS=(
     --advantage-estimator on_policy_distillation
     --teacher-model-name teacher
+    --teacher-score-mode full_vocab
+    --teacher-hf-checkpoint "${OPD_TEACHER_CKPT}"
+    --disable-compute-advantages-and-returns
 )
 
 LOSS_ARGS=(
+    --loss-type opd_full_vocab_loss
     --calculate-per-token-loss
 )
 
@@ -131,6 +150,8 @@ WANDB_ARGS=(
     --disable-wandb-random-suffix
 )
 
+# opd_full_vocab_loss requires tensor_model_parallel_size == 1 and context_parallel_size ==
+# 1 (asserted in orbit/utils/arguments.py) -- fine here since these are already 1.
 PERF_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
@@ -187,13 +208,6 @@ DEBUG_ARGS=(
     --log-passrate
 )
 
-PEFT_ARGS=(
-    --peft-method lora
-    --peft-variant standard
-    --lora-rank 32
-    --lora-alpha 64
-    --lora-dropout 0.0
-    --target-modules all-linear
-)
+PEFT_ARGS=()
 
 source "${ORBIT_ROOT}/scripts/lib/launcher.sh"

@@ -45,6 +45,12 @@ class Sample:
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     teacher_log_probs: list[float] | None = None  # Log probabilities from a frozen teacher model
+    # Teacher's last-layer hidden state per response position, used by full-vocab
+    # on-policy distillation instead of teacher_log_probs: the training side reconstructs
+    # the teacher's full vocab distribution by multiplying through the teacher's own LM
+    # head, rather than transmitting the (much larger) full logprob vector over HTTP.
+    # See --teacher-score-mode / --teacher-hf-checkpoint.
+    teacher_hidden_states: list[list[float]] | None = None
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
     )
@@ -190,6 +196,11 @@ class Sample:
             assert (
                 len(self.teacher_log_probs) == self.response_length
             ), f"teacher_log_probs length ({len(self.teacher_log_probs)}) != response_length ({self.response_length})"
+        if self.teacher_hidden_states is not None:
+            assert len(self.teacher_hidden_states) == self.response_length, (
+                f"teacher_hidden_states length ({len(self.teacher_hidden_states)}) != "
+                f"response_length ({self.response_length})"
+            )
         if self.rollout_routed_experts is not None:
             actual = len(self.rollout_routed_experts)
             expect = len(self.tokens) - 1
@@ -208,6 +219,8 @@ class Sample:
             self.rollout_log_probs = self.rollout_log_probs[:-n]
         if self.teacher_log_probs is not None:
             self.teacher_log_probs = self.teacher_log_probs[:-n]
+        if self.teacher_hidden_states is not None:
+            self.teacher_hidden_states = self.teacher_hidden_states[:-n]
         if self.loss_mask is not None:
             self.loss_mask = self.loss_mask[:-n]
         self.response = tokenizer.decode(self.tokens[-self.response_length :]) if self.response_length > 0 else ""
@@ -230,6 +243,7 @@ class Sample:
         self.weight_versions = []
         self.rollout_log_probs = None
         self.teacher_log_probs = None
+        self.teacher_hidden_states = None
         self.rollout_routed_experts = None
         self.status = Sample.Status.ABORTED
         self.non_generation_time = 0.0
