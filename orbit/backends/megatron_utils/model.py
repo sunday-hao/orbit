@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -41,7 +42,7 @@ from .initialize import is_megatron_main_rank
 from .low_precision_bootstrap import should_preload_low_precision_model_before_optimizer
 from .model_provider import get_model_provider_func
 from .parallel import get_packed_seq_params
-from .peft_utils import is_peft_enabled, is_peft_model, save_peft_checkpoint
+from .peft_utils import get_peft_method, is_peft_enabled, is_peft_model, save_peft_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +128,47 @@ def setup_model_and_optimizer(
 
 def _build_model(args: Namespace, role: str = "actor") -> list[DDP]:
     if is_peft_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
-        return _setup_peft_model_via_bridge(args)
+        model = _setup_peft_model_via_bridge(args)
+        _log_trainable_parameter_count(model, peft_method=get_peft_method(args))
+        return model
     return get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+
+
+def _log_trainable_parameter_count(model_chunks: list, *, peft_method: str) -> None:
+    """Log the total (global) number of parameters that need gradient updates.
+
+    Each rank first counts its own local shard (post TP/PP/EP partitioning).
+    Summing that local count over the whole world double-counts every shard
+    once per data/context-parallel replica, since DP and CP ranks each hold
+    an identical copy of every TP/PP/EP shard — so the world sum is divided
+    back down by the DP*CP replication factor to get the true global total.
+    """
+    total = 0
+    trainable = 0
+    for model_chunk in _ensure_model_list(model_chunks):
+        for param in model_chunk.parameters():
+            numel = param.numel()
+            total += numel
+            if param.requires_grad:
+                trainable += numel
+
+    if dist.is_available() and dist.is_initialized():
+        counts = torch.tensor([total, trainable], dtype=torch.long, device=torch.cuda.current_device())
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        dp_cp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+        total, trainable = (counts // dp_cp_size).tolist()
+
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    ratio = (trainable / total * 100) if total else 0.0
+    logger.info(
+        "PEFT (%s) total trainable parameters: %s / %s (%.4f%%)",
+        peft_method,
+        trainable,
+        total,
+        ratio,
+    )
 
 
 def _build_optimizer_and_scheduler(
