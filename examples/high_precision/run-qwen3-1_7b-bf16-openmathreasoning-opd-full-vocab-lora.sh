@@ -162,7 +162,7 @@ RL_ARGS=(
 )
 
 LOSS_ARGS=(
-    --loss-type opd_full_vocab_jsd_loss
+    --loss-type opd_jsd_loss
     --opd-jsd-beta 0.0
     --calculate-per-token-loss
     --use-kl-loss
