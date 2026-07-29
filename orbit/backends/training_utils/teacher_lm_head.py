@@ -19,11 +19,13 @@ import torch
 from safetensors import safe_open
 
 from .parallel import get_parallel_state
-from .vocab_parallel import vocab_shard_bounds
+from .vocab_parallel import vocab_shard_start
 
 logger = logging.getLogger(__name__)
 
 _TEACHER_LM_HEAD_CACHE: dict[str, torch.Tensor] = {}
+# Checkpoints whose cached weight has already been narrowed to this rank's vocabulary shard.
+_SHARDED: set[str] = set()
 
 
 def _find_weight_key(checkpoint_path: str) -> str:
@@ -47,13 +49,16 @@ def _load_weight_from_safetensors(checkpoint_path: str, weight_key: str) -> torc
         return f.get_tensor(weight_key)
 
 
-def load_teacher_lm_head(args: Namespace) -> torch.Tensor:
+def load_teacher_lm_head(args: Namespace, local_vocab_size: int | None = None) -> torch.Tensor:
     """Load (or return the cached) teacher LM head weight for this rank.
 
-    `[vocab_size, hidden_size]` under tensor_model_parallel_size == 1. Above that, the rows
-    are sliced down to the vocabulary columns this rank's output layer owns, so the student
-    and teacher sides of the divergence line up column-for-column; ranks whose shard runs
-    past the teacher's real vocabulary get correspondingly fewer rows, or none at all.
+    `local_vocab_size` is this rank's logit width. Passing it returns the vocabulary shard
+    whose rows line up column-for-column with the student's logits -- fewer rows, or none,
+    on ranks whose shard runs past the teacher's real vocabulary. Omitting it returns the
+    whole `[vocab_size, hidden_size]` weight, which is what the eager prefetch in
+    `actor.init()` wants: it only exists to get the safetensors read off the critical path.
+    The first call that does pass it shards the cached tensor in place, so from then on the
+    cache -- and the sleep()/wake_up() moves -- carry only this rank's rows.
 
     Loaded once per process, onto CPU, regardless of its current device -- callers that
     need it on GPU should go through `onload_teacher_lm_head` (see
@@ -63,32 +68,33 @@ def load_teacher_lm_head(args: Namespace) -> torch.Tensor:
     if checkpoint_path not in _TEACHER_LM_HEAD_CACHE:
         weight_key = _find_weight_key(checkpoint_path)
         weight = _load_weight_from_safetensors(checkpoint_path, weight_key)
-        vocab_size = weight.size(0)
-
-        if get_parallel_state().tp.size > 1:
-            start, end = vocab_shard_bounds(args.padded_vocab_size)
-            # .clone() rather than keeping the slice as a view, so the rows this rank does
-            # not own are actually freed -- the point of sharding is to not carry ~1.2 GiB
-            # (152k x 2048, fp32) per rank, GPU-resident between wake_up() and sleep().
-            weight = weight[start : min(end, vocab_size)].clone()
-            logger.info(
-                "Loaded teacher LM head %s from %s for full-vocab OPD: vocab [%d, %d) of %d, "
-                "shard %s",
-                weight_key,
-                checkpoint_path,
-                start,
-                min(end, vocab_size),
-                vocab_size,
-                tuple(weight.shape),
-            )
-        else:
-            logger.info(
-                "Loaded teacher LM head %s (%s) from %s for full-vocab OPD",
-                weight_key,
-                tuple(weight.shape),
-                checkpoint_path,
-            )
+        logger.info(
+            "Loaded teacher LM head %s (%s) from %s for full-vocab OPD",
+            weight_key,
+            tuple(weight.shape),
+            checkpoint_path,
+        )
         _TEACHER_LM_HEAD_CACHE[checkpoint_path] = weight
+
+    parallel_state = get_parallel_state()
+    if local_vocab_size is not None and parallel_state.tp.size > 1 and checkpoint_path not in _SHARDED:
+        weight = _TEACHER_LM_HEAD_CACHE[checkpoint_path]
+        vocab_size = weight.size(0)
+        start = vocab_shard_start(local_vocab_size)
+        stop = max(min(start + local_vocab_size, vocab_size), start)
+        # .clone() rather than keeping the slice as a view, so the rows this rank does not own
+        # are actually freed -- the point of sharding is to not carry the whole head (~1.2 GiB
+        # at 152k x 2048 in fp32) per rank, GPU-resident between wake_up() and sleep().
+        _TEACHER_LM_HEAD_CACHE[checkpoint_path] = weight[start:stop].clone()
+        _SHARDED.add(checkpoint_path)
+        logger.info(
+            "Sharded teacher LM head to vocab [%d, %d) of %d for TP rank %d/%d",
+            start,
+            stop,
+            vocab_size,
+            parallel_state.tp.rank,
+            parallel_state.tp.size,
+        )
     return _TEACHER_LM_HEAD_CACHE[checkpoint_path]
 
 

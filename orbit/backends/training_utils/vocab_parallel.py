@@ -1,8 +1,8 @@
 """Collectives for losses that need the *whole* vocabulary under tensor parallelism.
 
-Megatron's output layer is column-parallel over the padded vocabulary: with
-tensor_model_parallel_size == W each TP rank holds only `padded_vocab_size // W` logit
-columns. Losses that only need the sampled token's log-prob delegate to megatron.core's
+Megatron's output layer is column-parallel over the vocabulary: with
+tensor_model_parallel_size == W each TP rank holds only a `1/W` slice of the logit columns.
+Losses that only need the sampled token's log-prob delegate to megatron.core's
 fused vocab-parallel kernels, but a full-vocabulary divergence such as `opd_jsd_loss` has to
 normalize and reduce across the shards itself -- that is what these helpers provide.
 """
@@ -13,21 +13,17 @@ import torch.distributed as dist
 from .parallel import get_parallel_state
 
 
-def vocab_shard_bounds(padded_vocab_size: int) -> tuple[int, int]:
-    """Global `[start, end)` vocabulary columns this TP rank's output layer owns.
+def vocab_shard_start(local_vocab_size: int) -> int:
+    """Global index of this TP rank's first vocabulary column, given its logit width.
 
-    Mirrors Megatron's partition, which splits `padded_vocab_size` (see
-    `_vocab_size_with_padding` in orbit/backends/megatron_utils/arguments.py) into equal,
-    contiguous, rank-ordered chunks.
+    Megatron splits the output layer's vocabulary into equal, contiguous, rank-ordered
+    chunks -- the convention `fused_vocab_parallel_cross_entropy` already relies on -- so the
+    local width determines the offset. Derived from the logits rather than from
+    `args.padded_vocab_size` because the latter is only what the model was built with on the
+    non-bridge path; under `--megatron-to-hf-mode bridge` the vocabulary comes from the HF
+    config instead and the two disagree.
     """
-    parallel_state = get_parallel_state()
-    assert padded_vocab_size % parallel_state.tp.size == 0, (
-        f"padded_vocab_size ({padded_vocab_size}) is not divisible by "
-        f"tensor_model_parallel_size ({parallel_state.tp.size})"
-    )
-    shard = padded_vocab_size // parallel_state.tp.size
-    start = parallel_state.tp.rank * shard
-    return start, start + shard
+    return get_parallel_state().tp.rank * local_vocab_size
 
 
 class _ReduceFromVocabParallelRegion(torch.autograd.Function):

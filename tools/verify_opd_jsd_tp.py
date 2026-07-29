@@ -42,7 +42,6 @@ def build_args(beta: float, topk_overlap: bool) -> Namespace:
         opd_topk_overlap_ks=[1, 5, 20],
         use_kl_loss=False,
         teacher_hf_checkpoint=CHECKPOINT_KEY,
-        padded_vocab_size=PADDED_VOCAB_SIZE,
         qkv_format="thd",
         allgather_cp=False,
         log_probs_chunk_size=-1,
@@ -89,6 +88,8 @@ def set_tp_state(rank: int, tp_size: int, group: dist.ProcessGroup | None) -> No
 def run_loss(args: Namespace, logits: torch.Tensor, head: torch.Tensor, batch: dict):
     """Run the loss on `logits`, returning (loss, metrics, grad-w.r.t.-logits)."""
     teacher_lm_head_module._TEACHER_LM_HEAD_CACHE[CHECKPOINT_KEY] = head
+    # Already sliced by the caller, so stop load_teacher_lm_head() from sharding it again.
+    teacher_lm_head_module._SHARDED.add(CHECKPOINT_KEY)
     logits = logits.detach().clone().requires_grad_(True)
     loss, metrics = opd_jsd_loss_function(args, batch, logits, lambda x: x.sum())
     loss.backward()

@@ -35,7 +35,7 @@ from .vocab_parallel import (
     vocab_parallel_log_softmax,
     vocab_parallel_sum,
     vocab_parallel_topk_indices,
-    vocab_shard_bounds,
+    vocab_shard_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -993,19 +993,15 @@ def opd_jsd_loss_function(
     total_lengths = batch["total_lengths"]
 
     tp_group = parallel_state.tp.group if parallel_state.tp.size > 1 else None
-    teacher_lm_head = load_teacher_lm_head(args).to(logits.device, torch.float32)
+    # The student's logits are the authority on how the vocabulary is split -- they carry
+    # exactly this rank's shard, whichever global vocab size the model was actually built with.
+    local_vocab_size = logits.size(-1)
+    vocab_start = vocab_shard_start(local_vocab_size) if tp_group is not None else 0
+    teacher_lm_head = load_teacher_lm_head(args, local_vocab_size=local_vocab_size).to(
+        logits.device, torch.float32
+    )
+    # How many of this rank's vocab columns are real rather than divisibility padding.
     teacher_vocab_size = teacher_lm_head.size(0)
-    if tp_group is None:
-        vocab_start = 0
-    else:
-        vocab_start, vocab_end = vocab_shard_bounds(args.padded_vocab_size)
-        # Head and logits are sharded by different rank; a disagreement would silently compare
-        # different vocabulary entries on the two sides of the divergence.
-        assert vocab_end - vocab_start == logits.size(-1), (
-            f"teacher LM head sharded to vocab [{vocab_start}, {vocab_end}) from "
-            f"padded_vocab_size {args.padded_vocab_size}, but the student's logits carry "
-            f"{logits.size(-1)} columns on this rank."
-        )
 
     kl_per_sample = []
     entropy_per_sample = []
