@@ -779,10 +779,18 @@ async def eval_rollout_single_dataset(
 
     global EVAL_PROMPT_DATASET
 
+    # See the identical override in orbit/rollout/inference_rollout/inference_rollout_eval.py's
+    # eval_rollout_single_dataset for why this exists (train/eval share args within one run).
+    eval_chat_template_kwargs = (
+        args.eval_apply_chat_template_kwargs
+        if args.eval_apply_chat_template_kwargs is not None
+        else args.apply_chat_template_kwargs
+    )
+
     _eval_t0 = time.perf_counter()
     cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template, args.chat_template_path)
-    if args.apply_chat_template_kwargs:
-        cache_key += (json.dumps(args.apply_chat_template_kwargs, sort_keys=True),)
+    if eval_chat_template_kwargs:
+        cache_key += (json.dumps(eval_chat_template_kwargs, sort_keys=True),)
     _ds_built = False
     if cache_key not in EVAL_PROMPT_DATASET:
         _ds_t0 = time.perf_counter()
@@ -801,7 +809,7 @@ async def eval_rollout_single_dataset(
             metadata_key=dataset_cfg.metadata_key,
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=args.apply_chat_template,
-            apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            apply_chat_template_kwargs=eval_chat_template_kwargs,
         )
         _ds_built = True
         logger.info(
