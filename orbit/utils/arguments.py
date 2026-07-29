@@ -813,6 +813,17 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
             parser.add_argument(
+                "--eval-apply-chat-template-kwargs",
+                type=json.loads,
+                default=None,
+                help=(
+                    "JSON dict of tokenizer.apply_chat_template kwargs used for eval rollouts only "
+                    "(e.g. '{\"enable_thinking\": true}' to force thinking mode back on at eval time "
+                    "even when --apply-chat-template-kwargs disables it for training). Default None: "
+                    "falls back to --apply-chat-template-kwargs unchanged, so existing launchers are unaffected."
+                ),
+            )
+            parser.add_argument(
                 "--chat-template-path",
                 type=str,
                 default=None,
@@ -1077,13 +1088,17 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "opd_full_vocab_loss", "custom_loss"],
+                choices=[
+                    "policy_loss",
+                    "sft_loss",
+                    "opd_jsd_loss",
+                    "custom_loss",
+                ],
                 default="policy_loss",
                 help=(
                     "Choose loss type, currently support ppo policy_loss, sft_loss, or "
-                    "opd_full_vocab_loss (exact full-vocabulary KL against a frozen teacher, "
-                    "see --teacher-score-mode). If custom_loss is set, we will use the function "
-                    "path from `--custom-loss-function-path`."
+                    "opd_jsd_loss. If custom_loss is set, we will use the function path from "
+                    "`--custom-loss-function-path`."
                 ),
             )
             parser.add_argument(
@@ -1145,10 +1160,7 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
                     "scores only the response tokens the student already sampled, for the "
                     "REINFORCE-style on_policy_distillation advantage. 'full_vocab' requests the "
                     "teacher's last-layer hidden state at every response position "
-                    "(return_hidden_states=True) for use with --loss-type opd_full_vocab_loss's "
-                    "exact KL divergence -- the training side reconstructs the teacher's full "
-                    "vocab distribution via --teacher-hf-checkpoint's LM head, instead of "
-                    "transmitting the full logprob vector over HTTP."
+                    "(return_hidden_states=True) for use with --loss-type opd_jsd_loss's exact divergence."
                 ),
             )
             parser.add_argument(
@@ -1163,6 +1175,71 @@ def get_orbit_extra_args_provider(add_custom_arguments=None):
                     "Should be the same checkpoint referenced by the teacher's --sglang-config "
                     "model_path."
                 ),
+            )
+            parser.add_argument(
+                "--opd-jsd-beta",
+                type=float,
+                default=0.5,
+                help=(
+                    "Interpolation coefficient in [0, 1] for --loss-type opd_jsd_loss, "
+                    "matching TRL's GKDTrainer beta convention. 0.0 reduces to pure forward "
+                    "KL(teacher||student), 1.0 to pure reverse KL(student||teacher), and values "
+                    "in between mix through M = (1-beta)*student + beta*teacher. Ignored by "
+                    "every other --loss-type."
+                ),
+            )
+            parser.add_argument(
+                "--opd-log-prob-min-clamp",
+                type=float,
+                default=-30.0,
+                help=(
+                    "Floor on every real (non-padding) log-probability used by --loss-type "
+                    "opd_jsd_loss, bounding forward KL's otherwise unbounded "
+                    "-log(student_p) term. Lower than verl's forward_kl_topk -10, which floors "
+                    "a top-k distribution: over a full 150k vocab, -10 lifts the entire tail to "
+                    "4.5e-5 and fabricates ~7 units of teacher mass. Ignored by every other "
+                    "--loss-type."
+                ),
+            )
+            parser.add_argument(
+                "--opd-loss-max-clamp",
+                type=float,
+                default=10.0,
+                help=(
+                    "Ceiling applied to the per-response-position divergence value computed by "
+                    "--loss-type opd_jsd_loss, as a second line of defense on top of "
+                    "--opd-log-prob-min-clamp. Matches verl's forward_kl_topk loss_max_clamp. "
+                    "Ignored by every other --loss-type."
+                ),
+            )
+            parser.add_argument(
+                "--opd-jsd-pointwise-clip",
+                type=float,
+                default=None,
+                help=(
+                    "Ceiling applied to each individual (response-position, vocab-token) "
+                    "divergence contribution -- p(v) * (log p(v) - log q(v)) -- before summing "
+                    "over the vocabulary, for --loss-type opd_jsd_loss. This runs "
+                    "before, and is independent from, --opd-loss-max-clamp's ceiling on the "
+                    "already-vocab-summed per-position divergence. Borrowed from OPSD's "
+                    "(github.com/siyan-zhao/OPSD)"
+                ),
+            )
+            parser.add_argument(
+                "--opd-log-topk-overlap",
+                action="store_true",
+                default=False,
+                help=(
+                    "Debug-log and track the student/teacher top-k index overlap ratio -- "
+                    "|topk(student) ∩ topk(teacher)| / k -- at every response position."
+                ),
+            )
+            parser.add_argument(
+                "--opd-topk-overlap-ks",
+                type=int,
+                nargs="+",
+                default=[8, 16, 32, 64],
+                help="k values for --opd-log-topk-overlap's overlap-ratio diagnostic.",
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -2391,25 +2468,26 @@ def orbit_validate_args(args):
             f"{args.teacher_model_name}` entry with `update_weights: false` for the frozen teacher."
         )
 
-    if args.loss_type == "opd_full_vocab_loss":
+    if args.loss_type == "opd_jsd_loss":
         assert args.teacher_score_mode == "full_vocab", (
-            "--loss-type opd_full_vocab_loss requires --teacher-score-mode full_vocab "
+            f"--loss-type {args.loss_type} requires --teacher-score-mode full_vocab "
             "(the teacher must return its full-vocabulary distribution, not just the "
             "sampled token's log-prob)."
         )
         assert args.advantage_estimator == "on_policy_distillation", (
-            "--loss-type opd_full_vocab_loss reuses on_policy_distillation's teacher-serving "
+            f"--loss-type {args.loss_type} reuses on_policy_distillation's teacher-serving "
             "infra (TeacherGroup/placement groups) as its 'a teacher is configured' signal -- "
             "set --advantage-estimator on_policy_distillation even though its scalar advantage "
             "is unused here."
         )
         assert not args.compute_advantages_and_returns, (
-            "opd_full_vocab_loss computes its objective directly from logits; pass "
+            f"{args.loss_type} computes its objective directly from logits; pass "
             "--disable-compute-advantages-and-returns to skip the unused PPO-style pipeline."
         )
-        assert args.tensor_model_parallel_size == 1 and args.context_parallel_size == 1, (
-            "opd_full_vocab_loss doesn't yet support tensor_model_parallel_size > 1 or "
-            "context_parallel_size > 1."
+        assert not (args.context_parallel_size > 1 and args.allgather_cp), (
+            f"{args.loss_type} supports context parallelism, but not together with "
+            "--allgather-cp: its DSA sequence split is not the one get_sum_of_sample_mean "
+            "reduces over."
         )
         assert args.teacher_hf_checkpoint is not None, (
             "--teacher-score-mode full_vocab reconstructs the teacher's full vocab "
@@ -2417,6 +2495,25 @@ def orbit_validate_args(args):
             "--teacher-hf-checkpoint to the same checkpoint the teacher's --sglang-config "
             "model_path points at."
         )
+        assert 0.0 <= args.opd_jsd_beta <= 1.0, f"--opd-jsd-beta must be in [0, 1], got {args.opd_jsd_beta}"
+        assert args.opd_log_prob_min_clamp < 0.0, (
+            f"--opd-log-prob-min-clamp must be negative (it floors a log-probability), got "
+            f"{args.opd_log_prob_min_clamp}"
+        )
+        assert args.opd_loss_max_clamp > 0.0, (
+            f"--opd-loss-max-clamp must be positive (it ceilings a KL divergence, which is "
+            f"non-negative), got {args.opd_loss_max_clamp}"
+        )
+        if args.opd_jsd_pointwise_clip is not None:
+            assert args.opd_jsd_pointwise_clip > 0.0, (
+                f"--opd-jsd-pointwise-clip must be positive (it ceilings a per-vocab-entry "
+                f"divergence summand), got {args.opd_jsd_pointwise_clip}"
+            )
+        if args.opd_log_topk_overlap:
+            assert args.opd_topk_overlap_ks and all(k > 0 for k in args.opd_topk_overlap_ks), (
+                f"--opd-topk-overlap-ks must be a non-empty list of positive ints, got "
+                f"{args.opd_topk_overlap_ks}"
+            )
 
     if args.offload:
         args.offload_train = True

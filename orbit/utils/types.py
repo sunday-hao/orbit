@@ -46,11 +46,8 @@ class Sample:
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     teacher_log_probs: list[float] | None = None  # Log probabilities from a frozen teacher model
     # Teacher's last-layer hidden state per response position, used by full-vocab
-    # on-policy distillation instead of teacher_log_probs: the training side reconstructs
-    # the teacher's full vocab distribution by multiplying through the teacher's own LM
-    # head, rather than transmitting the (much larger) full logprob vector over HTTP.
-    # See --teacher-score-mode / --teacher-hf-checkpoint.
-    teacher_hidden_states: list[list[float]] | None = None
+    # on-policy distillation instead of teacher_log_probs
+    teacher_hidden_states: numpy.ndarray | None = None
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
     )
