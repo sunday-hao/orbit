@@ -3,7 +3,7 @@
 # against a frozen Qwen2.5-1.5B-Instruct teacher. Unlike the sampled-token OPD launcher
 # (run-qwen2_5-0_5b-bf16-gsm8k-opd-lora.sh), the teacher returns its full-vocabulary
 # distribution at every response position (--teacher-score-mode full_vocab) and the student
-# is trained with an exact KL divergence (--loss-type opd_full_vocab_loss) instead of the
+# is trained with an exact KL divergence (--loss-type opd_jsd_loss) instead of the
 # REINFORCE-style teacher_log_prob - student_log_prob advantage. Self-contained launcher.
 set -euo pipefail
 
@@ -151,7 +151,7 @@ OPTIMIZER_ARGS=(
 # reconstruct the teacher's full vocab distribution from that hidden state via the
 # teacher's own LM head (orbit/backends/training_utils/teacher_lm_head.py) -- far cheaper
 # than shipping a vocab-sized logprob vector per token over HTTP. --loss-type
-# opd_full_vocab_loss then computes the exact KL(student || teacher) directly from logits
+# opd_jsd_loss then computes the exact KL(student || teacher) directly from logits
 # -- no advantage/returns pipeline, hence --disable-compute-advantages-and-returns.
 RL_ARGS=(
     --advantage-estimator on_policy_distillation
@@ -179,8 +179,10 @@ WANDB_ARGS=(
     --disable-wandb-random-suffix
 )
 
-# opd_full_vocab_loss requires tensor_model_parallel_size == 1 and context_parallel_size ==
-# 1 (asserted in orbit/utils/arguments.py) -- fine here since these are already 1.
+# opd_jsd_loss supports tensor and context parallelism: the vocabulary shards across TP
+# ranks and the divergence reduces over them (orbit/backends/training_utils/vocab_parallel.py),
+# and the teacher hidden states are CP-split to match the logits. --allgather-cp is not
+# supported (asserted in orbit/utils/arguments.py).
 PERF_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
