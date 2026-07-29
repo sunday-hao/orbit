@@ -3,6 +3,7 @@ Utils to integrate SGLang's `/generate` endpoint with RL things like Sample.
 """
 
 import asyncio
+import logging
 from copy import deepcopy
 from typing import Any
 
@@ -12,6 +13,31 @@ import pybase64
 from orbit.utils.http_utils import post
 from orbit.utils.processing_utils import encode_image_for_rollout_engine
 from orbit.utils.types import Sample
+
+logger = logging.getLogger(__name__)
+
+# Element type of the teacher hidden states sglang sends back
+_HIDDEN_STATE_DTYPE = np.dtype(np.float32)
+
+_warned_legacy_hidden_states = False
+
+
+def _warn_legacy_hidden_states_format() -> None:
+    """Warn once per process that the teacher is on the slow nested-JSON path.
+
+    Emitted per sample would be one line per request, so this fires a single time and then
+    stays quiet.
+    """
+    global _warned_legacy_hidden_states
+    if _warned_legacy_hidden_states:
+        return
+    _warned_legacy_hidden_states = True
+    logger.warning(
+        "Teacher returned hidden_states as nested JSON floats rather than a base64 buffer. "
+        "This works but is the dominant cost of a full-vocab OPD step: the sglang server "
+        "spends minutes per step materializing hundreds of millions of Python floats and "
+        "serializing them to multi-GB JSON while its GPU idles."
+    )
 
 
 # Make this an isolated function because users may want to compute their own
@@ -139,8 +165,8 @@ async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]
     tokens were already sampled from the student's policy during rollout, so we just need
     the teacher's log-probs on those same tokens (--teacher-score-mode sampled_token) or its
     last-layer hidden state at those positions (--teacher-score-mode full_vocab, for
-    --loss-type opd_full_vocab_loss's exact KL -- the training side reconstructs the
-    teacher's full vocab distribution from the hidden state via the teacher's own LM head,
+    --loss-type opd_jsd_loss's exact divergence -- the training side reconstructs
+    the teacher's full vocab distribution from the hidden state via the teacher's own LM head,
     see orbit/backends/training_utils/teacher_lm_head.py, instead of transmitting the much
     larger full logprob vector over HTTP).
 
@@ -161,18 +187,11 @@ async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]
     async def _score_one(sample: Sample) -> None:
         if sample.response_length == 0:
             if full_vocab:
-                sample.teacher_hidden_states = []
+                sample.teacher_hidden_states = np.zeros((0, 0), dtype=np.float32)
             else:
                 sample.teacher_log_probs = []
             return
         if full_vocab:
-            # A max_new_tokens=0 request completes entirely during prefill, so sglang
-            # captures a hidden state for every position of the full input_ids we send
-            # (prompt+response) -- unlike input_token_logprobs, this isn't scoped by
-            # logprob_start_len and has no window-boundary artifact to drop. Slice the
-            # last response_length entries ourselves, matching the tokens[-response_length:]
-            # convention used elsewhere (e.g. orbit/backends/training_utils/loss.py's
-            # get_responses).
             payload = {
                 "input_ids": sample.tokens,
                 "sampling_params": {"max_new_tokens": 0},
@@ -193,23 +212,51 @@ async def compute_teacher_log_probs(args, model_name: str, samples: list[Sample]
                     "didn't match what compute_teacher_log_probs assumed. See "
                     "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
                 )
-            hidden_states = outer_hidden_states[0]
-            teacher_hidden_states = hidden_states[-sample.response_length :]
-            if len(teacher_hidden_states) != sample.response_length:
-                meta_info = output["meta_info"]
-                raise AssertionError(
-                    f"teacher hidden_states length ({len(teacher_hidden_states)}) != "
-                    f"response_length ({sample.response_length}) -- len(hidden_states)="
-                    f"{len(hidden_states)}, len(sample.tokens)={len(sample.tokens)}, "
-                    f"cached_tokens={meta_info.get('cached_tokens')}, "
-                    f"cached_tokens_details={meta_info.get('cached_tokens_details')}, "
-                    f"prompt_tokens={meta_info.get('prompt_tokens')}, "
-                    f"completion_tokens={meta_info.get('completion_tokens')}. sglang's "
-                    "return_hidden_states response shape didn't match what "
-                    "compute_teacher_log_probs assumed. See "
-                    "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
-                )
-            sample.teacher_hidden_states = teacher_hidden_states
+            # Reshape against the token count we sent: the trailing dimension is the
+            # teacher's hidden size, which we deliberately do not hardcode. A server that
+            # returned the wrong number of positions makes this fail outright rather than
+            # silently mis-slicing below.
+            expected_positions = len(sample.tokens)
+            payload_hidden_states = outer_hidden_states[0]
+            if isinstance(payload_hidden_states, str):
+                raw = pybase64.b64decode(payload_hidden_states.encode("ascii"))
+                if len(raw) % (expected_positions * _HIDDEN_STATE_DTYPE.itemsize) != 0:
+                    meta_info = output["meta_info"]
+                    raise AssertionError(
+                        f"teacher hidden_states buffer of {len(raw)} bytes is not a whole number "
+                        f"of {_HIDDEN_STATE_DTYPE.name} vectors over {expected_positions} positions "
+                        f"(len(sample.tokens)={len(sample.tokens)}, "
+                        f"response_length={sample.response_length}, "
+                        f"cached_tokens={meta_info.get('cached_tokens')}, "
+                        f"cached_tokens_details={meta_info.get('cached_tokens_details')}, "
+                        f"prompt_tokens={meta_info.get('prompt_tokens')}, "
+                        f"completion_tokens={meta_info.get('completion_tokens')}). sglang's "
+                        "return_hidden_states response shape didn't match what "
+                        "compute_teacher_log_probs assumed. See "
+                        "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
+                    )
+                hidden_states = np.frombuffer(raw, dtype=_HIDDEN_STATE_DTYPE).reshape(expected_positions, -1)
+            else:
+                _warn_legacy_hidden_states_format()
+                hidden_states = np.asarray(payload_hidden_states, dtype=_HIDDEN_STATE_DTYPE)
+                if hidden_states.ndim != 2 or hidden_states.shape[0] != expected_positions:
+                    raise AssertionError(
+                        f"teacher hidden_states has shape {hidden_states.shape}, expected "
+                        f"({expected_positions}, hidden_size) -- len(sample.tokens)="
+                        f"{len(sample.tokens)}, response_length={sample.response_length}. See "
+                        "orbit/backends/training_utils/teacher_lm_head.py and the full-vocab OPD plan."
+                    )
+            # hidden_states[t] is the state after consuming token t, so it is what predicts token t+1
+            hidden_start = len(sample.tokens) - sample.response_length - 1
+            assert hidden_start >= 0, (
+                "full-vocab teacher scoring needs at least one prompt token before the "
+                f"response (len(tokens)={len(sample.tokens)}, "
+                f"response_length={sample.response_length})"
+            )
+
+            sample.teacher_hidden_states = np.array(
+                hidden_states[hidden_start : hidden_start + sample.response_length]
+            )
             return
         prompt_length = len(sample.tokens) - sample.response_length
         # sglang always returns logprob=None for the first entry of whatever window

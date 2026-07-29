@@ -12,7 +12,13 @@ from pathlib import Path
 
 import httpx
 
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
 logger = logging.getLogger(__name__)
+logger.info(f"orjson {'found, using it for response JSON decoding' if orjson is not None else 'not found, falling back to the stdlib json decoder'}")
 
 ORBIT_HOST_IP_ENV = "ORBIT_HOST_IP"
 _PORT_LOCK_FDS: dict[int, int] = {}
@@ -235,6 +241,12 @@ def _next_actor():
     return actor
 
 
+def _decode_json(content: bytes):
+    if orjson is not None:
+        return orjson.loads(content)
+    return json.loads(content)
+
+
 async def _post(client, url, payload, max_retries=60, action="post", headers=None):
     retry_count = 0
     while retry_count < max_retries:
@@ -246,8 +258,8 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
                 response = await getattr(client, action)(url, json=payload or {}, headers=headers)
             response.raise_for_status()
             try:
-                output = response.json()
-            except json.JSONDecodeError:
+                output = _decode_json(response.content)
+            except ValueError:
                 output = response.text
         except Exception as e:
             retry_count += 1
