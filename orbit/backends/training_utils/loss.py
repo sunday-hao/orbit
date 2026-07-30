@@ -1031,35 +1031,36 @@ def opd_jsd_loss_function(
         # rather than -inf, which would go NaN (0 * -inf) on stray student mass
         teacher_log_probs_full = logits_chunk.new_full((logits_chunk.size(0), vocab_size), -1e4)
         if logits_chunk.size(0) > 0:
-            # from_numpy views the array off the wire; torch.tensor would copy element-wise.
-            teacher_hidden_states = torch.from_numpy(batch["teacher_hidden_states"][i])
-            if cp_size > 1:
-                # Keep the positions this rank's logits cover, in get_responses' chunk order.
-                teacher_hidden_states = torch.cat([teacher_hidden_states[lo:hi] for lo, hi in spans], dim=0)
-            teacher_hidden_states = teacher_hidden_states.to(dtype=torch.float32, device=logits_chunk.device)
-            # All that keeps response_chunk_spans() in step with get_responses -- and a single
-            # teacher row would broadcast into teacher_log_probs_full rather than raise.
-            assert teacher_hidden_states.size(0) == logits_chunk.size(0), (
-                f"sample {i}: {teacher_hidden_states.size(0)} teacher hidden-state rows vs "
-                f"{logits_chunk.size(0)} response logits -- response_chunk_spans() has drifted "
-                "from get_responses()."
-            )
-            teacher_logits = teacher_hidden_states @ teacher_lm_head.T
+            with torch.no_grad():
+                # from_numpy views the array off the wire; torch.tensor would copy element-wise.
+                teacher_hidden_states = torch.from_numpy(batch["teacher_hidden_states"][i])
+                if cp_size > 1:
+                    # Keep the positions this rank's logits cover, in get_responses' chunk order.
+                    teacher_hidden_states = torch.cat([teacher_hidden_states[lo:hi] for lo, hi in spans], dim=0)
+                teacher_hidden_states = teacher_hidden_states.to(dtype=torch.float32, device=logits_chunk.device)
+                # All that keeps response_chunk_spans() in step with get_responses -- and a single
+                # teacher row would broadcast into teacher_log_probs_full rather than raise.
+                assert teacher_hidden_states.size(0) == logits_chunk.size(0), (
+                    f"sample {i}: {teacher_hidden_states.size(0)} teacher hidden-state rows vs "
+                    f"{logits_chunk.size(0)} response logits -- response_chunk_spans() has drifted "
+                    "from get_responses()."
+                )
+                teacher_logits = teacher_hidden_states @ teacher_lm_head.T
 
-            rollout_temperature = float(args.rollout_temperature)
-            if rollout_temperature != 1.0:
-                teacher_logits = teacher_logits / rollout_temperature
-            # The clamp bounds forward KL, which weights by the fixed teacher probs.
-            teacher_log_probs_full[:, :teacher_vocab_size] = vocab_parallel_log_softmax(
-                teacher_logits, tp_group
-            ).clamp(min=args.opd_log_prob_min_clamp)
+                rollout_temperature = float(args.rollout_temperature)
+                if rollout_temperature != 1.0:
+                    teacher_logits.div_(rollout_temperature)
+                # The clamp bounds forward KL, which weights by the fixed teacher probs.
+                teacher_log_probs_full[:, :teacher_vocab_size] = vocab_parallel_log_softmax(
+                    teacher_logits, tp_group
+                ).clamp_(min=args.opd_log_prob_min_clamp)
 
         student_log_probs_full = vocab_parallel_log_softmax(logits_chunk.float(), tp_group).clamp(
             min=args.opd_log_prob_min_clamp
         )
         student_probs_full = student_log_probs_full.exp()
         teacher_probs_full = teacher_log_probs_full.exp()
-        
+
         ## compute overlap topk ratio
         if topk_ks:
             max_k = max(topk_ks)
@@ -1085,7 +1086,7 @@ def opd_jsd_loss_function(
             )
             kl_teacher_elem = teacher_probs_full * (teacher_log_probs_full - mixture_log_probs)
             kl_student_elem = student_probs_full * (student_log_probs_full - mixture_log_probs)
-            
+
             kl_elem = beta * kl_teacher_elem + (1 - beta) * kl_student_elem
 
         kl_elem = _clip_pointwise_kl(kl_elem, args.opd_jsd_pointwise_clip)
