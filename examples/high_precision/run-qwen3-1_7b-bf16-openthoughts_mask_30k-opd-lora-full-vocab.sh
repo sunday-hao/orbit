@@ -13,7 +13,7 @@ source "${ORBIT_ROOT}/scripts/lib/tool_env.sh"
 source "${ORBIT_ROOT}/scripts/lib/common.sh"
 
 # === Recipe identity ===
-LAUNCHER_NAME=run_qwen3_17b_bf16_openmathreasoning_megatron_opd_lora_full_vocab
+LAUNCHER_NAME=run_qwen3_17b_bf16_openthoughts_math_30k_megatron_opd_lora_full_vocab
 WANDB_PROJECT=${WANDB_PROJECT:-orbit-release}
 WANDB_GROUP=${WANDB_GROUP:-${LAUNCHER_NAME}}
 PRECISION_PROFILE=bf16
@@ -23,7 +23,7 @@ RUN_LOG="${ORBIT_ROOT}/logs/${LAUNCHER_NAME}_$(date +%Y%m%d_%H%M%S).log"
 # === Paths ===
 : "${HF_CKPT:?set HF_CKPT to the student Hugging Face checkpoint path}"
 : "${MEGATRON_LOAD:?set MEGATRON_LOAD to the student Megatron torch_dist checkpoint path}"
-SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen3-1.7B_4B_Instruct2507_openmathreasoning_opd_full_vocab_lora"
+SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen3-1.7B_4B_Instruct2507_openthoughts_math_30k_opd_full_vocab_lora"
 : "${TRAIN_JSONL:?set TRAIN_JSONL to a GSM8K training data path (.jsonl or .parquet)}"
 AIME24_PATH="${ORBIT_ROOT}/data/aime24/test.parquet"
 AIME25_PATH="${ORBIT_ROOT}/data/aime25/test.parquet"
@@ -44,7 +44,7 @@ RAY_NUM_CPUS=64
 source "${ORBIT_ROOT}/orbit_plugins/model_args/qwen3-1.7B.sh"   # provides MODEL_ARGS=(...)
 
 # === Training schedule ===
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
@@ -79,7 +79,7 @@ sglang:
       - worker_type: regular
         num_gpus: 2
         overrides:
-          mem_fraction_static: 0.35
+          mem_fraction_static: 0.4
           # --teacher-score-mode full_vocab needs the teacher's last-layer hidden states
           # (return_hidden_states=True per-request) to reconstruct its full vocab
           # distribution on the training side -- this is the server-startup flag that
@@ -111,7 +111,7 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --load "${MEGATRON_LOAD}"
     --save "${SAVE_DIR}"
-    --save-interval 250
+    --save-interval 100
     --no-save-optim
     --no-save-rng
     --megatron-to-hf-mode bridge
@@ -161,15 +161,20 @@ RL_ARGS=(
     --disable-compute-advantages-and-returns
 )
 
+# No --opd-jsd-pointwise-clip here (the arg defaults to None, which short-circuits
+# _clip_pointwise_kl entirely). At --opd-jsd-beta 0.0 the loss is forward KL, whose largest
+# per-vocab-entry summand sits on the teacher's argmax -- p_T*(log p_T - log q) is already
+# ~0.6 for p_T=0.9 against a student at q=0.5. A 0.1 ceiling saturates there, and clamp()
+# has zero gradient once saturated, so the clip removes gradient from exactly the token the
+# student most needs to learn while leaving the (unclipped) negative summands intact, biasing
+# the reported loss low. OPSD's --jsd_token_clip was tuned for the beta~0.5 JSD regime, where
+# the summands have a very different scale.
+# No --use-kl-loss either: --kl-loss-coef 0.0 made its contribution to the gradient exactly
+# zero while still paying for a reference-model forward pass every step.
 LOSS_ARGS=(
     --loss-type opd_jsd_loss
     --opd-jsd-beta 0.0
     --calculate-per-token-loss
-    --use-kl-loss
-    --kl-loss-type low_var_kl
-    --kl-loss-coef 0.0
-    --opd-log-topk-overlap
-    --opd-topk-overlap-ks 8 16 32 64
 )
 
 WANDB_ARGS=(
@@ -198,14 +203,14 @@ PERF_ARGS=(
 )
 
 EVAL_ARGS=(
-    --eval-interval 25
+    --eval-interval 20
     --eval-prompt-data aime24 "${AIME24_PATH}" aime25 "${AIME25_PATH}"
     --n-samples-per-eval-prompt 16
     --eval-max-response-len 8192
     --eval-top-k -1
     --eval-top-p 0.95
     --eval-temperature 1.0
-    --eval-pass-k-values 1 8 16
+    --eval-pass-k-values 1 2 4 8 16
 )
 
 SGLANG_ARGS=(

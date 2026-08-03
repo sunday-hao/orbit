@@ -3,7 +3,7 @@
 # against a frozen Qwen2.5-1.5B-Instruct teacher. Unlike the sampled-token OPD launcher
 # (run-qwen2_5-0_5b-bf16-gsm8k-opd-lora.sh), the teacher returns its full-vocabulary
 # distribution at every response position (--teacher-score-mode full_vocab) and the student
-# is trained with an exact KL divergence (--loss-type opd_jsd_loss) instead of the
+# is trained with an exact KL divergence (--loss-type opd_full_vocab_loss) instead of the
 # REINFORCE-style teacher_log_prob - student_log_prob advantage. Self-contained launcher.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ source "${ORBIT_ROOT}/scripts/lib/tool_env.sh"
 source "${ORBIT_ROOT}/scripts/lib/common.sh"
 
 # === Recipe identity ===
-LAUNCHER_NAME=run_qwen3_17b_bf16_openmathreasoning_megatron_opd_full_vocab_oft
+LAUNCHER_NAME=run_qwen3_17b_bf16_openreasoning100k_megatron_sampled_token_opd_oft
 WANDB_PROJECT=${WANDB_PROJECT:-orbit-release}
 WANDB_GROUP=${WANDB_GROUP:-${LAUNCHER_NAME}}
 PRECISION_PROFILE=bf16
@@ -23,7 +23,7 @@ RUN_LOG="${ORBIT_ROOT}/logs/${LAUNCHER_NAME}_$(date +%Y%m%d_%H%M%S).log"
 # === Paths ===
 : "${HF_CKPT:?set HF_CKPT to the student Hugging Face checkpoint path}"
 : "${MEGATRON_LOAD:?set MEGATRON_LOAD to the student Megatron torch_dist checkpoint path}"
-SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen3-1.7B_4B_Instruct2507_openmathreasoning_opd_full_vocab_oft"
+SAVE_DIR="${ORBIT_ROOT}/orbit_ckpts/Qwen3-1.7B_4B_Instruct2507_openreasoning100k_sampled_token_opd_oft"
 : "${TRAIN_JSONL:?set TRAIN_JSONL to a GSM8K training data path (.jsonl or .parquet)}"
 AIME24_PATH="${ORBIT_ROOT}/data/aime24/test.parquet"
 AIME25_PATH="${ORBIT_ROOT}/data/aime25/test.parquet"
@@ -37,17 +37,18 @@ HMMT25_PATH="${ORBIT_ROOT}/data/hmmt25/test.parquet"
 # Single GPU, --colocate: actor training, student rollout serving, and teacher serving all
 # time-share this one GPU via the offload/onload dance (see orbit/ray/teacher.py and the
 # create_opd_placement_groups() colocate branch in orbit/ray/placement_group.py).
-GPUS_PER_NODE=2
+GPUS_PER_NODE=4
 RAY_NUM_CPUS=64
 
 # === Model args ===
 source "${ORBIT_ROOT}/orbit_plugins/model_args/qwen3-1.7B.sh"   # provides MODEL_ARGS=(...)
 
 # === Training schedule ===
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
+#TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
 
 # `wc -l` undercounts .parquet files (binary) -- count rows with pyarrow instead.
 count_rows() {
@@ -71,37 +72,17 @@ sglang:
     update_weights: true
     server_groups:
       - worker_type: regular
-        num_gpus: 2
+        num_gpus: 4
   - name: teacher
     model_path: "${OPD_TEACHER_CKPT}"
     update_weights: false
     server_groups:
       - worker_type: regular
-        num_gpus: 2
+        num_gpus: 4
+        num_gpus_per_engine: 2
         overrides:
-          mem_fraction_static: 0.35
-          # --teacher-score-mode full_vocab needs the teacher's last-layer hidden states
-          # (return_hidden_states=True per-request) to reconstruct its full vocab
-          # distribution on the training side -- this is the server-startup flag that
-          # allows that.
-          enable_return_hidden_states: true
-          # A radix-cache hit skips the forward pass for the matched prefix, so no hidden
-          # state gets captured for those positions -- confirmed on a real run (a
-          # per-request cache-salt didn't reliably avoid this). Disabling the cache
-          # entirely guarantees every position gets a fresh hidden state; the teacher is
-          # only ever used for scoring here, so losing prefix-cache speedups doesn't cost
-          # much.
-          disable_radix_cache: true
-          # Root cause of hidden_states truncation, confirmed against sglang's own source
-          # (scheduler_output_processor_mixin.py): hidden-state capture lives inside
-          # `if req.is_chunked <= 0:`, so only the LAST chunk of a chunked-prefill request
-          # ever gets its hidden states appended -- every earlier chunk is silently
-          # dropped. -1 disables chunked prefill entirely (not "a very large chunk size" --
-          # sglang maps -1 to rem_chunk_tokens=None internally, its "chunking disabled"
-          # state), so a scoring request's prefill is never split into chunks regardless of
-          # length, rather than relying on a fixed size staying ahead of
-          # --rollout-max-response-len.
-          chunked_prefill_size: -1
+          mem_fraction_static: 0.3
+          max_running_requests: 8
 EOF
 
 # === ARGS arrays ===
@@ -111,7 +92,7 @@ CKPT_ARGS=(
     --hf-checkpoint "${HF_CKPT}"
     --load "${MEGATRON_LOAD}"
     --save "${SAVE_DIR}"
-    --save-interval 250
+    --save-interval 10
     --no-save-optim
     --no-save-rng
     --megatron-to-hf-mode bridge
@@ -135,41 +116,25 @@ ROLLOUT_ARGS=(
 
 OPTIMIZER_ARGS=(
     --optimizer adam
-    --lr 2e-6
+    --lr 5e-6
     --lr-decay-style cosine
-    --min-lr 2e-7
-    --lr-decay-iters 500
-    --lr-warmup-fraction 0.05
+    --min-lr 5e-7
+    --lr-warmup-fraction 0.1
     --weight-decay 0.01
     --adam-beta1 0.9
     --adam-beta2 0.999
 )
 
-# --teacher-score-mode full_vocab makes compute_teacher_log_probs request the teacher's
-# last-layer hidden state at every response position (return_hidden_states=True), instead
-# of just the sampled token's log-prob. --teacher-hf-checkpoint lets the training side
-# reconstruct the teacher's full vocab distribution from that hidden state via the
-# teacher's own LM head (orbit/backends/training_utils/teacher_lm_head.py) -- far cheaper
-# than shipping a vocab-sized logprob vector per token over HTTP. --loss-type
-# opd_jsd_loss then computes the exact KL(student || teacher) directly from logits
-# -- no advantage/returns pipeline, hence --disable-compute-advantages-and-returns.
+
 RL_ARGS=(
     --advantage-estimator on_policy_distillation
     --teacher-model-name teacher
-    --teacher-score-mode full_vocab
-    --teacher-hf-checkpoint "${OPD_TEACHER_CKPT}"
-    --disable-compute-advantages-and-returns
+    --teacher-score-mode sampled_token
 )
 
 LOSS_ARGS=(
-    --loss-type opd_jsd_loss
-    --opd-jsd-beta 0.0
+    --loss-type policy_loss
     --calculate-per-token-loss
-    --use-kl-loss
-    --kl-loss-type low_var_kl
-    --kl-loss-coef 0.0
-    --opd-log-topk-overlap
-    --opd-topk-overlap-ks 8 16 32 64
 )
 
 WANDB_ARGS=(
@@ -179,12 +144,9 @@ WANDB_ARGS=(
     --disable-wandb-random-suffix
 )
 
-# opd_jsd_loss supports tensor and context parallelism: the vocabulary shards across TP
-# ranks and the divergence reduces over them (orbit/backends/training_utils/vocab_parallel.py),
-# and the teacher hidden states are CP-split to match the logits. --allgather-cp is not
-# supported (asserted in orbit/utils/arguments.py).
+
 PERF_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
     --expert-model-parallel-size 1
@@ -199,7 +161,8 @@ PERF_ARGS=(
 
 EVAL_ARGS=(
     --eval-interval 20
-    --eval-prompt-data aime24 "${AIME24_PATH}" aime25 "${AIME25_PATH}"
+    --skip-eval-before-train
+    --eval-prompt-data aime24 "${AIME24_PATH}" aime25 "${AIME25_PATH}" hmmt25 "${HMMT25_PATH}"
     --n-samples-per-eval-prompt 16
     --eval-max-response-len 8192
     --eval-top-k -1
@@ -209,16 +172,16 @@ EVAL_ARGS=(
 )
 
 SGLANG_ARGS=(
-    --num-gpus-per-node 2
+    --num-gpus-per-node 4
     --rollout-num-gpus-per-engine 1
     --sglang-mem-fraction-static 0.25
+    --sglang-server-concurrency 8
     --rollout-num-gpus 0
-    --teacher-num-gpus 2
+    --teacher-num-gpus 4
     --sglang-config "${OPD_SGLANG_CONFIG}"
-    --sglang-max-running-requests 1024
+    --sglang-max-running-requests 512
     --router-disable-circuit-breaker
-    # flashinfer, not fa3 -- SGLang has no separate "fa2" backend name, flashinfer is its
-    # own FA2-equivalent kernel.
+    # flashinfer, or fa3
     --sglang-attention-backend fa3
 )
 
