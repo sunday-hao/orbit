@@ -239,31 +239,4 @@ PEFT_ARGS=(
     --peft-method none
 )
 
-# === Stage 1: train ===
-# launcher.sh ends in `exit`, so it runs in a subshell -- that keeps this script alive
-# for stage 2 and, because the Ray cleanup trap is an EXIT trap, guarantees the
-# training actors and their GPU memory are gone before the eval server starts.
-if [ "${RUN_TRAIN}" = "1" ]; then
-    echo "[m4_opd_fkl_full] $(date +%FT%T) training start -> ${SAVE_DIR}"
-    train_status=0
-    ( source "${ORBIT_ROOT}/scripts/lib/launcher.sh" ) || train_status=$?
-    if [ "${train_status}" -ne 0 ]; then
-        echo "[m4_opd_fkl_full] training failed (exit ${train_status}); see ${RUN_LOG}" >&2
-        exit "${train_status}"
-    fi
-    echo "[m4_opd_fkl_full] $(date +%FT%T) training done"
-else
-    echo "[m4_opd_fkl_full] skipping training (RUN_TRAIN=0)"
-fi
-
-# === Stage 2: evaluate every saved checkpoint ===
-if [ "${RUN_EVAL}" != "1" ]; then
-    echo "[m4_opd_fkl_full] skipping evaluation (RUN_EVAL=0)"
-    exit 0
-fi
-if [ ! -d "${SAVE_DIR}" ]; then
-    echo "[m4_opd_fkl_full] ERROR: ${SAVE_DIR} does not exist -- nothing to evaluate." >&2
-    exit 1
-fi
-
 source "${ORBIT_ROOT}/scripts/lib/launcher.sh"
