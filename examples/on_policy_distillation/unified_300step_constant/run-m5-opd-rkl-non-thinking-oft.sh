@@ -153,4 +153,93 @@ OPTIMIZER_ARGS=(
     --clip-grad 1.0
 )
 
+# The frozen teacher is served by this job: orbit launches it as an extra sglang model
+# entry with update_weights=false and the scoring-correctness server flags baked in
+# (orbit/ray/rollout.py::_teacher_server_overrides).
+RL_ARGS=(
+    --opd-type sglang
+    --teacher-hf-checkpoint "${OPD_TEACHER_CKPT}"
+    --opd-serve-teacher
+    --opd-teacher-num-gpus "${OPD_TEACHER_NUM_GPUS}"
+    --opd-teacher-mem-fraction "${OPD_TEACHER_MEM_FRACTION:-0.35}"
+    --opd-teacher-max-running-requests "${OPD_TEACHER_MAX_RUNNING_REQUESTS:-32}"
+    --opd-teacher-max-prefill-tokens "${OPD_TEACHER_MAX_PREFILL_TOKENS:-4096}"
+    --advantage-estimator grpo
+    --teacher-score-mode full_vocab
+    --opd-defer-full-vocab-scoring
+    --disable-compute-advantages-and-returns
+)
+
+LOSS_ARGS=(
+    --loss-type opd_jsd_loss
+    --opd-jsd-beta "${OPD_JSD_BETA:-1.0}"
+    --calculate-per-token-loss
+    # --opd-log-topk-overlap
+    # --opd-topk-overlap-ks 8 16 32 64
+)
+
+WANDB_ARGS=(
+    --use-wandb
+    --wandb-project "${WANDB_PROJECT}"
+    --wandb-group "${WANDB_GROUP}"
+    --disable-wandb-random-suffix
+)
+
+PERF_ARGS=(
+    --tensor-model-parallel-size 2
+    --pipeline-model-parallel-size 1
+    --context-parallel-size 1
+    --expert-model-parallel-size 1
+    --expert-tensor-parallel-size 1
+    --use-dynamic-batch-size
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}"
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers 1
+    --sequence-parallel
+)
+
+# Emptied by validate_eval_args because DISABLE_EVAL=1 above.
+EVAL_ARGS=()
+
+SGLANG_ARGS=(
+    --num-gpus-per-node "${GPUS_PER_NODE}"
+    --rollout-num-gpus-per-engine 1
+    --rollout-num-gpus "${ROLLOUT_NUM_GPUS}"
+    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.25}"
+    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY:-16}"
+    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS:-512}"
+    --router-disable-circuit-breaker
+    # fa3 is rejected on B200/SM100 by the pinned SGLang; use triton there.
+    --sglang-attention-backend "${SGLANG_ATTENTION_BACKEND:-fa3}"
+    --sglang-sampling-backend "${SGLANG_SAMPLING_BACKEND:-flashinfer}"
+)
+
+MISC_ARGS=(
+    --seed 42
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --attention-backend flash
+    --accumulate-allreduce-grads-in-fp32
+    --attention-softmax-in-fp32
+    --no-offload-train
+    --no-offload-train-async
+    --offload-rollout
+    --cuda-graph-impl local
+    --cuda-graph-scope full_iteration
+    --te-rng-tracker
+    --no-check-for-nan-in-loss-and-grad
+)
+
+DEBUG_ARGS=( --log-passrate )
+
+PEFT_ARGS=(
+    --peft-method oft
+    --peft-variant standard
+    --oft-type canonical_oft
+    --oft-block-size "${OFT_BLOCK_SIZE:-128}"
+    --oft-eps "${OFT_EPS:-6e-5}"
+    --target-modules all-linear
+)
+
 source "${ORBIT_ROOT}/scripts/lib/launcher.sh"
